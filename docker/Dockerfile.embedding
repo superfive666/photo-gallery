@@ -1,0 +1,54 @@
+# 人脸检测 + embedding 推理服务。
+# 构建上下文是仓库根目录（compose 里 context: .），因为需要 COPY libs/。
+FROM python:3.11-slim AS base
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    # InsightFace 默认把模型放在 ~/.insightface
+    INSIGHTFACE_HOME=/opt/insightface
+
+# opencv 与 onnxruntime 的运行时依赖。装完立刻清 apt 缓存。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 \
+        libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY embedding/requirements.txt ./embedding/requirements.txt
+RUN pip install -r embedding/requirements.txt
+
+# 共享包。放在源码之前，改业务代码不会让这层缓存失效。
+COPY libs ./libs
+RUN pip install -e ./libs
+
+# ---------------------------------------------------------------------------
+# 模型权重在构建时下载并打进镜像（约 +300MB）。
+# 不在运行时拉取：否则每次冷启动都依赖外网，且首个请求会超时。
+# ---------------------------------------------------------------------------
+ARG MODEL_NAME=buffalo_l
+RUN python - <<'PY'
+import os
+from insightface.app import FaceAnalysis
+
+name = os.environ.get("MODEL_NAME", "buffalo_l")
+# prepare() 会触发下载。ctx_id=-1 表示 CPU。
+app = FaceAnalysis(name=name, allowed_modules=["detection", "recognition"],
+                   providers=["CPUExecutionProvider"])
+app.prepare(ctx_id=-1, det_size=(640, 640))
+print(f"model {name} downloaded")
+PY
+
+COPY embedding ./embedding
+
+# 非 root 运行。模型目录要能被读。
+RUN useradd --create-home --uid 10001 appuser \
+    && chown -R appuser:appuser /opt/insightface
+USER appuser
+
+EXPOSE 8000
+
+# 单 worker：模型只加载一份，内存可控；并发由服务内部的 threadpool 提供。
+# 多 worker 会让每个 worker 各加载一份模型，内存 ×N 且收益有限。
+CMD ["uvicorn", "embedding.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

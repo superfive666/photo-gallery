@@ -1,0 +1,31 @@
+# 离线任务。一次性容器，由 `docker compose run --rm jobs ...` 或 CI 触发。
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+COPY jobs/requirements.txt ./jobs/requirements.txt
+RUN pip install -r jobs/requirements.txt
+
+COPY libs ./libs
+RUN pip install -e ./libs
+
+COPY jobs ./jobs
+# 测试也进镜像：`make test-py` 直接在这个容器里跑，无需宿主机装 Python 环境
+COPY api ./api
+COPY pyproject.toml ./pyproject.toml
+
+# jobs/ 下是 jobs 包本身，加进 PYTHONPATH 才能 `python -m jobs`
+ENV PYTHONPATH=/app:/app/jobs
+
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /tmp/ingest \
+    && chown appuser:appuser /tmp/ingest
+USER appuser
+
+# 默认不做任何事，由 compose run 指定子命令
+ENTRYPOINT []
+CMD ["python", "-m", "jobs", "--help"]

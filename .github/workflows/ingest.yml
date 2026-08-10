@@ -1,0 +1,75 @@
+name: Ingest
+
+# 定时增量建库。自建 runner（需要访问生产数据库与源站）。
+on:
+  schedule:
+    # ⚠️ cron 是 UTC。这里是新加坡时间次日 02:00（UTC+8）。
+    # 改时间时记得换算，这是最常踩的坑。
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      album:
+        description: 'album id，留空则处理全部相册'
+        required: false
+        type: string
+      full:
+        description: '全量重跑（忽略 checksum 缓存）'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# 建库不允许并发：两个 ingest 同时跑会互相争抢 embedding 服务并产生冗余下载。
+concurrency:
+  group: ingest-production
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: [self-hosted, linux, x64, zrc-prod]
+    if: github.repository == 'superfive666/photo-gallery'
+    # 大相册全量重跑可能要几小时（CPU 推理 0.1~0.3s/张）
+    timeout-minutes: 480
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 确认服务在运行
+        run: |
+          docker compose up -d db embedding
+          # embedding 加载模型需要时间，等它 healthy 再开始
+          for _ in $(seq 1 30); do
+            if [ "$(docker compose ps -q embedding | xargs docker inspect -f '{{.State.Health.Status}}')" = "healthy" ]; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::embedding 服务未就绪"
+          exit 1
+
+      - name: 建库
+        id: ingest
+        run: |
+          args=""
+          if [ -n "${{ inputs.album }}" ]; then args="$args --album ${{ inputs.album }}"; fi
+          if [ "${{ inputs.full }}" = "true" ]; then args="$args --full"; fi
+          docker compose run --rm jobs python -m jobs ingest $args | tee ingest-report.json
+
+      # 新照片会产生新的 face，簇必须跟着更新，否则新人搜不到。
+      # 即使 ingest 部分失败也要跑 —— 已入库的那部分同样需要聚类。
+      - name: 重跑聚类
+        if: always() && steps.ingest.outcome != 'skipped'
+        run: docker compose run --rm jobs python -m jobs cluster | tee cluster-report.json
+
+      - name: 上传报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingest-report-${{ github.run_number }}
+          path: |
+            ingest-report.json
+            cluster-report.json
+          retention-days: 30
+          if-no-files-found: warn

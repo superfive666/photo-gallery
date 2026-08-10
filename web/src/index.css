@@ -1,0 +1,60 @@
+@import 'tailwindcss';
+
+/* 设计系统的单一来源。组件里只用这些语义 token，不写字面色值。
+   完整规范见 web/.claude/skills/design-system/SKILL.md。 */
+@theme {
+  /* 中性色阶 —— 照片是主角，界面要退后 */
+  --color-ink-50: oklch(98% 0.002 270);
+  --color-ink-100: oklch(95% 0.003 270);
+  --color-ink-200: oklch(89% 0.004 270);
+  --color-ink-400: oklch(65% 0.008 270);
+  --color-ink-600: oklch(48% 0.01 270);
+  --color-ink-800: oklch(27% 0.012 270);
+  --color-ink-900: oklch(18% 0.014 270);
+  --color-ink-950: oklch(12% 0.016 270);
+
+  /* 强调色只用于「开始检索」这一个主动作 */
+  --color-accent-400: oklch(72% 0.15 250);
+  --color-accent-500: oklch(63% 0.17 250);
+  --color-accent-600: oklch(55% 0.17 250);
+
+  --color-danger-500: oklch(60% 0.19 25);
+  --color-warn-500: oklch(72% 0.15 75);
+
+  --radius-card: 0.875rem;
+
+  --font-sans:
+    system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei',
+    sans-serif;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    /* 深色底：照片在深色背景上观感更好，也更省手机电量 */
+    background-color: var(--color-ink-950);
+    color: var(--color-ink-100);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    /* 结果网格滚动时避免橡皮筋把固定头部带走 */
+    overscroll-behavior-y: none;
+  }
+
+  /* 键盘可达性：焦点环必须清晰可见，不允许被 outline-none 抹掉 */
+  :focus-visible {
+    outline: 2px solid var(--color-accent-400);
+    outline-offset: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}

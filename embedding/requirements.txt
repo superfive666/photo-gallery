@@ -1,0 +1,13 @@
+# embedding 服务。模型权重在构建镜像时下载并打包，不在运行时拉取。
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+
+# InsightFace + ONNXRuntime（CPU）
+insightface==0.7.3
+onnxruntime==1.20.1
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+Pillow==11.1.0
+
+structlog==24.4.0

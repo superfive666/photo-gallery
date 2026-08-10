@@ -1,0 +1,22 @@
+[project]
+name = "gallery-core"
+version = "0.1.0"
+description = "api 与 jobs 共享的核心代码：DB 模型、embedding 客户端、配置、向量工具"
+requires-python = ">=3.11"
+dependencies = [
+    "sqlalchemy[asyncio]>=2.0.30",
+    "asyncpg>=0.29",
+    "pgvector>=0.3.0",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "httpx>=0.27",
+    "numpy>=1.26",
+    "structlog>=24.1",
+]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["gallery_core*"]

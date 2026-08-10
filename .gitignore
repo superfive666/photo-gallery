@@ -1,0 +1,35 @@
+# secrets / 环境
+.env
+.env.*
+!.env.example
+
+# 评估集含真人照片，永不进 git
+eval/
+*.csv.local
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# node
+node_modules/
+web/dist/
+.vite/
+*.tsbuildinfo
+
+# 模型权重（构建时下载，不进 git）
+models/
+*.onnx
+
+# 运行时产物
+tmp/
+*.log
+.DS_Store

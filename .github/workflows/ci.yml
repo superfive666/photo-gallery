@@ -1,0 +1,116 @@
+name: CI
+
+# ⚠️ 这个 workflow 必须跑在 GitHub 托管 runner 上。
+# 自建 runner 只用于部署（deploy.yml / ingest.yml），绝不用于 PR 的 CI ——
+# 否则 fork 提的 PR 就能在自建机器上执行任意代码。见 docs/cicd.md。
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: photo_gallery_test
+          POSTGRES_USER: gallery
+          POSTGRES_PASSWORD: test-password
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://gallery:test-password@localhost:5432/photo_gallery_test
+      PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/libs:${{ github.workspace }}/jobs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r api/requirements.txt -r jobs/requirements.txt
+          pip install -e ./libs
+          pip install ruff mypy
+
+      - name: ruff
+        run: |
+          ruff check api jobs libs embedding
+          ruff format --check api jobs libs embedding
+
+      - name: mypy
+        run: mypy api jobs libs embedding
+
+      - name: 迁移能跑通
+        run: python -m jobs migrate
+
+      - name: pytest
+        run: pytest -q
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装依赖
+        run: npm ci || npm install
+
+      - name: typecheck
+        run: npx tsc --noEmit
+
+      - name: eslint
+        run: npm run lint
+
+      - name: prettier
+        run: npx prettier --check "src/**/*.{ts,tsx,css}"
+
+      - name: vitest
+        run: npm run test -- --run
+
+      - name: build
+        run: npm run build
+
+  docker:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # embedding 不在这里构建：它要下载 300MB 模型权重，每个 PR 都跑太浪费。
+        # 由 deploy.yml 在 main 上构建，或按 paths 过滤单独触发。
+        service: [api, jobs, web]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build ${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.${{ matrix.service }}
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

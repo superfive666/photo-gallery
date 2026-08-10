@@ -1,0 +1,26 @@
+# 业务 API。不含任何模型 —— 镜像轻量，可自由扩容。
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+COPY api/requirements.txt ./api/requirements.txt
+RUN pip install -r api/requirements.txt
+
+COPY libs ./libs
+RUN pip install -e ./libs
+
+COPY api ./api
+
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
+
+EXPOSE 8000
+
+# 多 worker 没问题（不加载模型），但要注意 rate_limit 是进程内状态 ——
+# 多 worker 下每个进程各有一份计数器，实际限流额度会被放大 N 倍。
+# 需要严格限流时保持单 worker，或把 rate_limit 换成 Redis 实现。
+CMD ["uvicorn", "api.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
