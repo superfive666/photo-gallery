@@ -32,14 +32,15 @@ eval/
 `labels.csv`：
 
 ```csv
-person_id,gallery_path,face_bbox
-person_01,2024-annual-dinner/IMG_0231.jpg,"412,208,468,281"
-person_01,2024-annual-dinner/IMG_0245.jpg,
+person_id,gallery_path
+person_01,2026-08-10/IMG_0231.jpg
+person_01,2026-07-20/IMG_0245.jpg
+person_02,2026-08-10/IMG_0231.jpg
 ...
 ```
 
 - 每人 **3~5 张**已知出现的照片，覆盖不同活动、不同角度、至少一张「困难样本」（侧脸或小脸）。
-- `face_bbox` 可留空（只标「这张照片里有这个人」）；标了可以额外评估检测器的定位质量。
+- 同一张照片里有多个被标注的人是正常的（合影），各占一行。
 - 必须包含**长得像的人**（兄弟姐妹、相似发型），这是误报的主要来源，不含它们的评估集会给出
   虚高的 precision。
 - 评估集里的人必须**明确同意**参与测试。评估集不进 git（含真人照片），
@@ -66,6 +67,7 @@ person_01,2024-annual-dinner/IMG_0245.jpg,
 
 ```bash
 # 1. 把评估集的 gallery 灌进库（指向一个独立的测试数据库，别污染生产库）
+#    local_dir adapter 会把 gallery/ 下的一级子目录名当作 album slug
 SOURCE_ADAPTER=local_dir SOURCE_LOCAL_DIR=/data/eval/gallery make ingest
 make cluster
 
@@ -86,9 +88,11 @@ make eval SWEEP=1        # 阈值网格扫描，给出建议阈值
 6. `--sweep` 时在 `PERSON_MATCH_THRESHOLD × FACE_MATCH_THRESHOLD` 网格上扫描，
    输出 precision ≥ 0.95 前提下 recall 最大的组合。
 
-> `labels.csv` 里的 `gallery_path` 是相对 `gallery/` 的路径，评估用它复算
-> `local_dir` adapter 的 `source_asset_id` 来对上库里的照片。两处算法必须一致，
-> 有测试 `jobs/tests/test_eval.py::test_asset_id_matches_local_dir_adapter` 钉住这一点。
+> `labels.csv` 里的 `gallery_path` 是相对 `gallery/` 的路径（形如
+> `2026-08-10/IMG_0001.jpg`），评估用 `local_dir.photo_url_for()` 把它换算成库里的
+> `photo_url` 来对行。URL 规则只在那一个函数里定义，有测试
+> `jobs/tests/test_eval.py::test_photo_url_matches_local_dir_adapter` 钉住这一点 ——
+> 两处各写一遍的话，评估会把每张照片都判成 not_ingested，指标全为 0。
 
 ## 当前默认值（未标定，仅为占位）
 
@@ -97,7 +101,7 @@ FACE_MATCH_THRESHOLD    = 0.42    # 单脸直接命中
 PERSON_MATCH_THRESHOLD  = 0.38    # 簇心匹配，可略松（簇心更稳）
 MIN_DET_SCORE           = 0.50
 MIN_FACE_PX             = 40
-CLUSTER_MIN_SAMPLES     = 3       # HDBSCAN
+CLUSTER_MIN_SAMPLES     = 3       # DBSCAN
 CLUSTER_EPS             = 0.30
 ```
 

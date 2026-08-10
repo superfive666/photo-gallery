@@ -10,6 +10,15 @@
   ③ 合并两路，每张照片取其上所有命中脸的最高相似度作为得分。
 
 ② 不能省：没有它，孤立出现的人永远搜不到。
+
+## 关于 album 过滤
+
+face 按 album 做 LIST 分区，所以带 `album =` 条件的查询会被裁剪到单个分区，
+只在那一个相册里做向量检索 —— 又快又精确。
+
+不带 album 时（主流程：找所有活动的照片）无法裁剪，Postgres 需要对每个分区各做一次
+HNSW 索引扫描再 MergeAppend。相册数量上到千级时开销会变得明显，
+见 docs/schema/README.md「分区的代价」。
 """
 
 from __future__ import annotations
@@ -25,26 +34,21 @@ from gallery_core.db import apply_search_tuning
 
 # 候选簇上限。一个查询自拍不该匹配到很多人；取太多只会引入误报。
 _MAX_PERSON_CANDIDATES = 10
-# 直接命中脸的 KNN 上限
-_MAX_FACE_CANDIDATES = 500
 
 
 @dataclass(frozen=True, slots=True)
 class PhotoMatch:
     photo_id: uuid.UUID
-    album_id: uuid.UUID
-    album_name: str
-    filename: str
-    taken_at: str | None
+    album: str
+    photo_url: str
     score: float
-    has_thumb: bool
+    has_thumbnail: bool
 
 
 @dataclass(frozen=True, slots=True)
 class SearchOutcome:
     matches: list[PhotoMatch]
     person_candidates: int
-    face_candidates: int
 
 
 def _to_pgvector(vec: list[float]) -> str:
@@ -54,23 +58,24 @@ def _to_pgvector(vec: list[float]) -> str:
 
 # 候选簇：屏蔽名单在 SQL 层过滤，不在应用层结果集里过滤 ——
 # 后者容易在新增查询路径时被漏掉，导致 opt-out 静默失效。
+#
+# person 不分区（一个人跨多个相册），所以这一段不受 album 过滤影响；
+# album 的裁剪发生在下面 _MATCH_SQL 对 face 的扫描上。
 _PERSON_SQL = text(
     """
     SELECT p.id, 1 - (p.centroid <=> CAST(:q AS vector)) AS similarity
     FROM person p
-    WHERE NOT EXISTS (
-              SELECT 1 FROM block_list b WHERE b.person_id = p.id
-          )
-      AND 1 - (p.centroid <=> CAST(:q AS vector)) >= :threshold
+    WHERE NOT EXISTS (SELECT 1 FROM block_list b WHERE b.person_id = p.id)
+      AND 1 - (p.centroid <=> CAST(:q AS vector)) >= :person_threshold
     ORDER BY p.centroid <=> CAST(:q AS vector)
-    LIMIT :limit
+    LIMIT :person_limit
     """
 )
 
 # 合并两路命中并按最佳分打分。
-#   - 只取 public 相册（private 不该出现在检索结果里）
-#   - 排除软删除的照片
-#   - 排除被屏蔽的 person / photo
+#
+# `:album IS NULL OR f.album = :album` 这个写法能被 Postgres 在执行时裁剪分区
+# （runtime pruning）；写成 `f.album = COALESCE(:album, f.album)` 就不行了。
 _MATCH_SQL = text(
     """
     WITH hit AS (
@@ -78,6 +83,7 @@ _MATCH_SQL = text(
         SELECT f.photo_id, 1 - (f.embedding <=> CAST(:q AS vector)) AS sim
         FROM face f
         WHERE f.person_id = ANY(CAST(:person_ids AS uuid[]))
+          AND (:album IS NULL OR f.album = :album)
 
         UNION ALL
 
@@ -85,22 +91,19 @@ _MATCH_SQL = text(
         SELECT f.photo_id, 1 - (f.embedding <=> CAST(:q AS vector)) AS sim
         FROM face f
         WHERE 1 - (f.embedding <=> CAST(:q AS vector)) >= :face_threshold
+          AND (:album IS NULL OR f.album = :album)
     )
-    SELECT ph.id            AS photo_id,
-           ph.album_id      AS album_id,
-           a.name           AS album_name,
-           ph.filename      AS filename,
-           ph.taken_at      AS taken_at,
-           (ph.thumb_webp IS NOT NULL) AS has_thumb,
-           MAX(hit.sim)     AS score
+    SELECT ph.id                        AS photo_id,
+           ph.album                     AS album,
+           ph.photo_url                 AS photo_url,
+           (ph.thumbnail IS NOT NULL)   AS has_thumbnail,
+           MAX(hit.sim)                 AS score
     FROM hit
     JOIN photo ph ON ph.id = hit.photo_id
-    JOIN album a  ON a.id = ph.album_id
     WHERE ph.deleted_at IS NULL
-      AND a.visibility = 'public'
       AND NOT EXISTS (SELECT 1 FROM block_list b WHERE b.photo_id = ph.id)
-    GROUP BY ph.id, ph.album_id, a.name, ph.filename, ph.taken_at, ph.thumb_webp IS NOT NULL
-    ORDER BY score DESC, ph.taken_at DESC NULLS LAST
+    GROUP BY ph.id, ph.album, ph.photo_url, ph.thumbnail IS NOT NULL
+    ORDER BY score DESC, ph.album DESC
     LIMIT :limit
     """
 )
@@ -110,11 +113,13 @@ async def search_by_embedding(
     session: AsyncSession,
     query_vec: list[float],
     settings: Settings,
+    album: str | None = None,
     limit: int | None = None,
 ) -> SearchOutcome:
     """`query_vec` 必须是已 L2 归一化的单位向量。
 
     多张自拍的情况由调用方先用 `mean_embedding` 合成单一查询点后再进来。
+    `album` 非空时只在该相册内检索（走分区裁剪）。
     """
     # 调高 HNSW 召回参数。必须是事务级 SET LOCAL，否则会污染连接池里的这条连接。
     await apply_search_tuning(session)
@@ -126,8 +131,8 @@ async def search_by_embedding(
             _PERSON_SQL,
             {
                 "q": q,
-                "threshold": settings.person_match_threshold,
-                "limit": _MAX_PERSON_CANDIDATES,
+                "person_threshold": settings.person_match_threshold,
+                "person_limit": _MAX_PERSON_CANDIDATES,
             },
         )
     ).all()
@@ -141,6 +146,7 @@ async def search_by_embedding(
                 # 空数组也要传：= ANY('{}') 恒为 false，等价于只走兜底那一路
                 "person_ids": person_ids,
                 "face_threshold": settings.face_match_threshold,
+                "album": album,
                 "limit": min(limit or settings.max_results, settings.max_results),
             },
         )
@@ -149,18 +155,12 @@ async def search_by_embedding(
     matches = [
         PhotoMatch(
             photo_id=r.photo_id,
-            album_id=r.album_id,
-            album_name=r.album_name,
-            filename=r.filename,
-            taken_at=r.taken_at.isoformat() if r.taken_at else None,
+            album=r.album,
+            photo_url=r.photo_url,
             score=float(r.score),
-            has_thumb=bool(r.has_thumb),
+            has_thumbnail=bool(r.has_thumbnail),
         )
         for r in rows
     ]
 
-    return SearchOutcome(
-        matches=matches,
-        person_candidates=len(person_ids),
-        face_candidates=min(len(rows), _MAX_FACE_CANDIDATES),
-    )
+    return SearchOutcome(matches=matches, person_candidates=len(person_ids))

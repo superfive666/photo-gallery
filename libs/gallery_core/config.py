@@ -29,9 +29,16 @@ class Settings(BaseSettings):
 
     # --- embedding 服务 ---
     embedding_service_url: str = "http://embedding:8000"
-    embedding_timeout_seconds: float = 60.0
+    # 批量请求可能要跑几十秒，超时要比单张宽松得多
+    embedding_timeout_seconds: float = 300.0
     model_name: str = "buffalo_l"
     model_version: str = "1"
+
+    # --- 离线批量 ---
+    # 一批多少张照片。实际值会与 embedding 服务 /healthz 报的 max_batch_images 取小。
+    ingest_batch_images: int = 16
+    # 一批的字节上限。只限张数不限字节，遇到一批高像素原图会直接顶穿内存。
+    ingest_batch_max_bytes: int = 128 * 1024 * 1024
 
     # --- 检索阈值 ---
     # ⚠️ 以下默认值是文献经验值，不是本项目的标定结果。见 docs/evaluation.md。
@@ -52,8 +59,6 @@ class Settings(BaseSettings):
     invite_code_hash: str = ""
     jwt_secret: str = PLACEHOLDER_SECRET
     session_ttl_hours: int = 12
-    signed_url_secret: str = PLACEHOLDER_SECRET
-    signed_url_ttl_seconds: int = 300
     audit_hash_salt: str = PLACEHOLDER_SECRET
 
     # --- 上传防护 ---
@@ -61,23 +66,22 @@ class Settings(BaseSettings):
     max_upload_bytes: int = 10 * 1024 * 1024
     max_selfies_per_search: int = 3
 
-    # --- 源站 ---
-    source_adapter: Literal["local_dir", "static_gallery"] = "local_dir"
+    # --- 源站 photos.zrc.sg（公开、无需鉴权）---
+    source_adapter: Literal["local_dir", "static_gallery"] = "static_gallery"
     source_base_url: str = "https://photos.zrc.sg"
-    source_token: str = ""
     source_local_dir: str = "/data/sample-albums"
+    # 抓取纪律：默认保守，别把自己家的图库打挂
     source_concurrency: int = 4
     source_rate_limit_per_second: float = 5.0
     source_user_agent: str = "zrc-face-search/0.1 (+https://faces.zrc.sg)"
 
-    # --- 缩略图 ---
+    # --- 缩略图（仅在源站未提供时本地生成）---
     thumb_max_edge: int = 256
     thumb_quality: int = 75
 
     # --- 其他 ---
     log_level: str = "INFO"
     schema_dir: str = "docs/schema"
-    ingest_tmp_dir: str = "/tmp/ingest"  # noqa: S108 — compose 里挂的是限容 tmpfs
 
     def model_tag(self) -> str:
         """写入 face.model_name / model_version 的组合标识，用于溯源与重算。"""
@@ -91,7 +95,6 @@ class Settings(BaseSettings):
         """
         candidates = {
             "JWT_SECRET": self.jwt_secret,
-            "SIGNED_URL_SECRET": self.signed_url_secret,
             "AUDIT_HASH_SALT": self.audit_hash_salt,
         }
         return [name for name, value in candidates.items() if value == PLACEHOLDER_SECRET]

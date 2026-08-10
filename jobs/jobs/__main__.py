@@ -1,9 +1,10 @@
 """jobs CLI。
 
 python -m jobs migrate
+python -m jobs probe  [--album 2026-08-10]        # 探查源站页面结构
 python -m jobs ingest [--album ID] [--full]
 python -m jobs cluster
-python -m jobs eval [--dir /data/eval] [--sweep]
+python -m jobs eval   [--dir /data/eval] [--sweep]
 python -m jobs block --person <uuid> | --photo <uuid> [--reason ...]
 """
 
@@ -15,21 +16,19 @@ import json
 import sys
 import uuid
 from pathlib import Path
+from typing import Any
 
 from gallery_core.config import get_settings
 from gallery_core.db import get_engine, session_scope
-from gallery_core.embedding_client import EmbeddingClient
+from gallery_core.embedding_client import EmbeddingClient, EmbeddingServiceError
 from gallery_core.logging import configure_logging, get_logger
+from jobs.sources.base import SourceAdapter
 
 log = get_logger(__name__)
 
 
-def build_adapter() -> object:
-    """按 SOURCE_ADAPTER 选择源站实现。
-
-    photos.zrc.sg 的接入方式确定之前，用 local_dir 推进全部其他工作。
-    见 docs/data-source.md。
-    """
+def build_adapter() -> SourceAdapter:
+    """按 SOURCE_ADAPTER 选择源站实现。"""
     s = get_settings()
     if s.source_adapter == "local_dir":
         from jobs.sources.local_dir import LocalDirAdapter
@@ -40,7 +39,6 @@ def build_adapter() -> object:
 
     return StaticGalleryAdapter(
         base_url=s.source_base_url,
-        token=s.source_token,
         user_agent=s.source_user_agent,
         concurrency=s.source_concurrency,
         rate_limit_per_second=s.source_rate_limit_per_second,
@@ -56,29 +54,97 @@ async def cmd_migrate(_args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_probe(args: argparse.Namespace) -> int:
+    """对着真站跑一次解析，打印看到了什么。不写数据库。
+
+    photos.zrc.sg 的相册页标记结构尚未确认，`static_gallery.py` 里是通用解析。
+    用这个命令确认解析结果是否正确，再把解析收敛成精确的选择器。
+    """
+    adapter = build_adapter()
+    report: dict[str, Any] = {"adapter": get_settings().source_adapter}
+
+    try:
+        albums = await adapter.list_albums()
+        report["albums_discovered"] = len(albums)
+        report["albums_sample"] = albums[:10]
+    except Exception as exc:
+        report["albums_error"] = f"{type(exc).__name__}: {exc}"
+        albums = []
+
+    target = args.album or (albums[0] if albums else None)
+    if target is None:
+        report["hint"] = "没发现相册且未指定 --album，无法探查资产。请用 --album 指定一个 slug。"
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 1
+
+    report["probed_album"] = target
+    try:
+        assets = [a async for a in adapter.list_assets(target)]
+    except Exception as exc:
+        report["assets_error"] = f"{type(exc).__name__}: {exc}"
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 1
+
+    images = [a for a in assets if a.kind == "image"]
+    videos = [a for a in assets if a.kind == "video"]
+    report["assets_total"] = len(assets)
+    report["images"] = len(images)
+    report["videos"] = len(videos)
+    report["with_source_thumbnail"] = sum(1 for a in images if a.thumbnail_url)
+    report["assets_sample"] = [
+        {"filename": a.filename, "photo_url": a.photo_url, "thumbnail_url": a.thumbnail_url}
+        for a in assets[:5]
+    ]
+
+    if not assets:
+        report["hint"] = (
+            "解析到 0 个资产 —— 通用 HTML 解析没匹配上这个站点的结构。"
+            "把相册页的 HTML 片段贴出来，就能把 _parse_album_page 收敛成精确选择器。"
+        )
+
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if hasattr(adapter, "aclose"):
+        await adapter.aclose()
+    return 0 if assets else 1
+
+
 async def cmd_ingest(args: argparse.Namespace) -> int:
     from jobs.pipeline import ingest
 
     s = get_settings()
     adapter = build_adapter()
     async with EmbeddingClient() as embedding:
-        if not await embedding.healthy():
+        try:
+            health: dict[str, Any] | None = await embedding.health()
+        except EmbeddingServiceError as exc:
+            log.warning("embedding_health_failed", error_type=type(exc).__name__)
+            health = None
+        if not health or not health.get("model_loaded"):
             log.error("embedding_unavailable", url=s.embedding_service_url)
             print("embedding 服务不可用，中止。", file=sys.stderr)
             return 2
 
+        if not health.get("batch_supported"):
+            print(
+                "提示：embedding 服务报告识别模型不支持可变 batch，批量会退化成逐张前向。"
+                "GPU 利用率上不去，值得排查模型导出方式。",
+                file=sys.stderr,
+            )
+
         async with session_scope() as session:
             stats = await ingest(
                 session,
-                adapter,  # type: ignore[arg-type]
+                adapter,
                 embedding,
                 s,
                 album_filter=args.album,
                 full=args.full,
             )
 
-    report = stats.as_dict()
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if hasattr(adapter, "aclose"):
+        await adapter.aclose()
+
+    print(json.dumps(stats.as_dict(), ensure_ascii=False, indent=2))
 
     # 丢弃的人脸数偏高时主动提示 —— 这是「后排的人搜不到」的根因，
     # 遇到它该调 MIN_FACE_PX / det_size，而不是调相似度阈值。
@@ -188,9 +254,12 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("migrate", help="执行 docs/schema 下未应用的迁移")
 
-    p_ingest = sub.add_parser("ingest", help="拉取源站相册并建库")
+    p_probe = sub.add_parser("probe", help="探查源站页面结构，不写数据库")
+    p_probe.add_argument("--album", help="要探查的 album slug，例如 2026-08-10")
+
+    p_ingest = sub.add_parser("ingest", help="拉取源站相册并建库（批量）")
     p_ingest.add_argument("--album", help="只处理指定相册；省略则处理全部")
-    p_ingest.add_argument("--full", action="store_true", help="忽略 checksum 缓存，全量重新处理")
+    p_ingest.add_argument("--full", action="store_true", help="忽略已入库记录，全部重新处理")
 
     sub.add_parser("cluster", help="全量重跑 person 聚类")
 
@@ -209,6 +278,7 @@ def main(argv: list[str] | None = None) -> int:
 
     handlers = {
         "migrate": cmd_migrate,
+        "probe": cmd_probe,
         "ingest": cmd_ingest,
         "cluster": cmd_cluster,
         "eval": cmd_eval,

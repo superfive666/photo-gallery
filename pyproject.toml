@@ -30,7 +30,7 @@ warn_unreachable = true
 plugins = []
 # 第三方库缺 stub 的不阻塞
 [[tool.mypy.overrides]]
-module = ["insightface.*", "cv2.*", "hdbscan.*", "sklearn.*", "onnxruntime.*"]
+module = ["insightface.*", "cv2.*", "hdbscan.*", "sklearn.*", "onnxruntime.*", "lxml.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -2,8 +2,12 @@
 
 以自拍为查询条件，在 [photos.zrc.sg](https://photos.zrc.sg) 的历史活动相册中检索出「有我的照片」。
 
-本项目是 photos.zrc.sg 的**旁挂部署**，不修改原站。它离线抓取原站指定 album 的照片、提取人脸
-embedding 落库，再提供一个上传自拍即可实时检索的 Web 界面。
+本项目是 [photos.zrc.sg](https://photos.zrc.sg) 的**旁挂部署**，不修改原站。
+原站是一个公开、无需鉴权的跑团照片墙，照片和视频按 album 分组
+（`photos.zrc.sg/album/2026-08-10`）。
+
+本项目离线抓取指定 album 的照片、批量提取人脸 embedding 落库，
+再提供一个上传自拍即可实时检索的 Web 界面。
 
 ---
 
@@ -31,10 +35,20 @@ embedding 落库，再提供一个上传自拍即可实时检索的 Web 界面�
 ## 三条主链路
 
 ```
-① 离线建库   jobs → photos.zrc.sg → 人脸检测/embedding → Postgres(pgvector) → 人脸聚类成 person
-② 在线检索   web → api → embedding(自拍) → pgvector KNN → 聚合到 person → 返回照片 URL + 缩略图
-③ 前端界面   上传/拍摄自拍 → 展示匹配结果网格 → lightbox / 跳回原站原图
+① 离线建库   jobs → photos.zrc.sg → 批量人脸检测/embedding → Postgres(pgvector) → 聚类成 person
+② 在线检索   web → api → embedding(自拍) → pgvector KNN → 聚合到 person → 照片 URL + 缩略图
+③ 前端界面   上传/拍摄自拍（可选限定相册）→ 结果网格 → lightbox / 跳回原站原图
 ```
+
+数据模型只有两张主表：
+
+| 表 | 一行是什么 | 关键字段 |
+| --- | --- | --- |
+| `photo` | 一张照片/视频 | `id`(uuidv7) `album` `photo_url` `thumbnail` |
+| `face` | **一张脸** | `id`(uuidv7) `photo_id` `album` `embedding(512)` |
+
+一张合影有多个人 → 一条 photo 对应多条 face，这是分表的原因。
+`face` 按 `album` 做 LIST 分区，使「只在某次活动里找」能被裁剪成单分区精确检索。
 
 详见 [`docs/architecture.md`](docs/architecture.md)。
 
@@ -43,12 +57,16 @@ embedding 落库，再提供一个上传自拍即可实时检索的 Web 界面�
 ## 快速开始
 
 ```bash
-cp .env.example .env          # 填入 SOURCE_* 与 INVITE_CODE / JWT_SECRET
-make up                       # 起 postgres + embedding + api + web
-make migrate                  # 执行 docs/schema 下的 DDL
-make ingest ALBUM=<album-id>  # 手动跑一次离线建库
+cp .env.example .env               # 填入 INVITE_CODE_HASH / JWT_SECRET / AUDIT_HASH_SALT
+make up                            # 起 postgres + embedding + api + web
+make migrate                       # 执行 docs/schema 下的 DDL
+make probe  ALBUM=2026-08-10       # 先探查源站页面结构，确认解析正确
+make ingest ALBUM=2026-08-10       # 批量拉取 + embedding + 落库
+make cluster                       # 人脸聚类成 person
 open http://localhost:8080
 ```
+
+`INVITE_CODE_HASH` 用 `python -m api.app.tools.hash_invite` 生成（明文邀请码不进 .env）。
 
 常用命令见 `make help`。
 
@@ -64,16 +82,22 @@ open http://localhost:8080
 - **儿童照片、跨越多年的照片**准确率下降明显 —— 人脸随年龄变化，ArcFace 对此不鲁棒。
 - **误报无法归零。** 阈值是 precision/recall 的权衡，调高会漏、调低会串人。阈值标定方法见
   [`docs/evaluation.md`](docs/evaluation.md)。
-- **视频当前不处理**（第一期范围外），见 `docs/plans/`。
+- **视频当前不处理**（只登记不提取），见 `docs/plans/`。
+- **相册页解析目前是通用实现。** 源站的确切标记结构还没确认，`jobs probe` 用于验证；
+  见 [`docs/data-source.md`](docs/data-source.md)。
 
 ---
 
 ## 隐私
 
 - 用户上传的自拍**只在内存中处理**，提取 embedding 后立即丢弃；不落盘、不落库、不写日志。
+  这条纪律由 `api/tests/test_no_persistence.py` 做源码级守卫，不只是文档承诺。
 - 人脸 embedding 属于生物识别数据（新加坡 PDPA）。数据的用途、留存与删除方式见
   [`docs/privacy.md`](docs/privacy.md)。
-- 站点需要邀请码才能使用 —— 公开开放会让任何人拿一张他人照片就能扒出该人的全部活动照片。
+- **源站公开不等于本站可以公开。** 原站上找某人的照片得一张张翻，而这里输入一张自拍就能
+  把他在所有活动里的照片一次性聚齐 —— 可及性的量变就是隐私上的质变。
+  所以本站需要邀请码。
+- 本项目只存 256px 缩略图，原图始终只是一个指向源站的 URL，不复制、不缓存。
 - 提供 opt-out：可按 person 或按照片将内容从检索结果中永久屏蔽。
 
 ---

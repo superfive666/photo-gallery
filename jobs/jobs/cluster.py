@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import uuid
 
 import numpy as np
 from sklearn.cluster import DBSCAN
@@ -21,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from gallery_core.config import Settings
 from gallery_core.logging import get_logger
 from gallery_core.models import Face, JobRun, Person
+from gallery_core.uuid7 import uuid7
 from gallery_core.vector import mean_embedding
 
 log = get_logger(__name__)
@@ -41,7 +41,7 @@ async def recluster(session: AsyncSession, settings: Settings) -> dict[str, obje
     try:
         rows = (
             await session.execute(
-                select(Face.id, Face.embedding).where(
+                select(Face.id, Face.album, Face.embedding).where(
                     Face.model_name == settings.model_name,
                     Face.model_version == settings.model_version,
                 )
@@ -53,7 +53,7 @@ async def recluster(session: AsyncSession, settings: Settings) -> dict[str, obje
             run.status = "succeeded"
             return stats
 
-        face_ids = [r.id for r in rows]
+        face_keys = [(r.album, r.id) for r in rows]
         matrix = np.asarray([r.embedding for r in rows], dtype=np.float32)
 
         # 向量已 L2 归一化，所以 cosine 距离 = 1 - 点积，可以直接用 metric="cosine"。
@@ -77,7 +77,7 @@ async def recluster(session: AsyncSession, settings: Settings) -> dict[str, obje
             centroid = mean_embedding([matrix[i].tolist() for i in member_idx])
 
             person = Person(
-                id=uuid.uuid4(),
+                id=uuid7(),
                 centroid=centroid.tolist(),
                 face_count=len(member_idx),
                 model_name=settings.model_name,
@@ -86,21 +86,31 @@ async def recluster(session: AsyncSession, settings: Settings) -> dict[str, obje
             session.add(person)
             await session.flush()
 
-            await session.execute(
-                text("UPDATE face SET person_id = :pid WHERE id = ANY(CAST(:ids AS uuid[]))"),
-                {"pid": str(person.id), "ids": [str(face_ids[i]) for i in member_idx]},
-            )
+            # face 是按 album 分区的，UPDATE 必须带上 album 才能裁剪到相关分区；
+            # 只按 id 更新会扫描全部分区。一个簇通常跨多个相册，所以按 album 分组批量更新。
+            by_album: dict[str, list[str]] = {}
+            for i in member_idx:
+                album, face_id = face_keys[i]
+                by_album.setdefault(album, []).append(str(face_id))
+            for album, ids in by_album.items():
+                await session.execute(
+                    text(
+                        "UPDATE face SET person_id = :pid "
+                        "WHERE album = :album AND id = ANY(CAST(:ids AS uuid[]))"
+                    ),
+                    {"pid": str(person.id), "album": album, "ids": ids},
+                )
             person_count += 1
 
         await session.commit()
 
         stats = {
-            "faces": len(face_ids),
+            "faces": len(face_keys),
             "persons": person_count,
             # 噪声点比例是聚类质量的直接信号：过高说明 eps 太小或人脸质量太差。
             # 这些脸只能靠检索的「直接命中」那一路被找到。
             "noise": noise,
-            "noise_ratio": round(noise / len(face_ids), 4),
+            "noise_ratio": round(noise / len(face_keys), 4),
         }
         log.info("cluster_done", **stats)
         run.status = "succeeded"

@@ -1,4 +1,4 @@
-"""embedding 服务。只有 /extract 与健康检查。"""
+"""embedding 服务。/extract（单张，在线检索用）与 /extract/batch（批量，离线建库用）。"""
 
 from __future__ import annotations
 
@@ -11,17 +11,27 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from embedding.app.model import FaceExtractor
+from embedding.app.model import ExtractOutcome, FaceExtractor
 from gallery_core.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
+
 
 MODEL_NAME = os.getenv("MODEL_NAME", "buffalo_l")
 MODEL_VERSION = os.getenv("MODEL_VERSION", "1")
 MIN_DET_SCORE = float(os.getenv("MIN_DET_SCORE", "0.5"))
 MIN_FACE_PX = int(os.getenv("MIN_FACE_PX", "40"))
 ORT_NUM_THREADS = int(os.getenv("ORT_NUM_THREADS", "4"))
+USE_GPU = _env_bool("EMBEDDING_USE_GPU")
+REC_BATCH_SIZE = int(os.getenv("REC_BATCH_SIZE", "64"))
 MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(40 * 1024 * 1024)))
+# 一次 /extract/batch 最多几张图。上限存在的意义是给内存设一个天花板：
+# 每张图解码后是 W×H×3 字节，32 张 4000×3000 的图就是 ~1.1GB。
+MAX_BATCH_IMAGES = int(os.getenv("MAX_BATCH_IMAGES", "32"))
 
 _extractor = FaceExtractor(
     model_name=MODEL_NAME,
@@ -29,11 +39,13 @@ _extractor = FaceExtractor(
     min_det_score=MIN_DET_SCORE,
     min_face_px=MIN_FACE_PX,
     num_threads=ORT_NUM_THREADS,
+    use_gpu=USE_GPU,
+    rec_batch_size=REC_BATCH_SIZE,
 )
 
-# 推理是同步 CPU 密集调用。并发度限制在线程数附近：
-# 超出只会加剧 CPU 争抢，让所有请求一起变慢，不如排队。
-_inference_slots = asyncio.Semaphore(ORT_NUM_THREADS)
+# 推理是同步的密集调用。同时在跑的推理请求数限制在线程数附近：
+# 超出只会加剧争抢，让所有请求一起变慢，不如排队。
+_inference_slots = asyncio.Semaphore(max(1, ORT_NUM_THREADS))
 
 
 @asynccontextmanager
@@ -41,7 +53,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     configure_logging(os.getenv("LOG_LEVEL", "INFO"))
     # 阻塞加载放到线程里，避免拖住 event loop 的启动
     await asyncio.to_thread(_extractor.load)
-    yield
+    try:
+        yield
+    finally:
+        _extractor.close()
 
 
 app = FastAPI(title="face-embedding", version="0.1.0", lifespan=lifespan)
@@ -55,16 +70,36 @@ class FaceOut(BaseModel):
     landmarks: dict[str, object] | None = None
 
 
-class ExtractOut(BaseModel):
+class ImageResult(BaseModel):
     faces: list[FaceOut]
     # 通过检测但被质量门控丢弃的数量。调用方会把它记进 photo.faces_discarded，
     # 用于「漏检归因」——判断召回不足是小脸被丢，还是相似度不够。
     discarded: int
     image_width: int
     image_height: int
+    # 非 None 表示这一张失败了（解码/检测出错），而不是「没有检测到人脸」。
+    # 两者对调用方意义完全不同：前者要标 failed 并重试，后者是正常结果。
+    error: str | None = None
+
+
+class ExtractOut(ImageResult):
     model_name: str
     model_version: str
     latency_ms: int
+
+    model_config = {"protected_namespaces": ()}
+
+
+class BatchExtractOut(BaseModel):
+    # 与入参图片一一对应、顺序一致
+    results: list[ImageResult]
+    model_name: str
+    model_version: str
+    latency_ms: int
+    faces_total: int
+    # 本次识别前向是否真的走了批量。false 说明模型的 batch 维被固定成 1，
+    # 退化成逐张前向 —— GPU 利用率上不去，值得排查。
+    batched: bool
 
     model_config = {"protected_namespaces": ()}
 
@@ -76,40 +111,14 @@ async def healthz() -> dict[str, object]:
         "model_loaded": _extractor.loaded,
         "model_name": MODEL_NAME,
         "model_version": MODEL_VERSION,
+        "gpu": USE_GPU,
+        "batch_supported": _extractor.batch_supported,
+        "max_batch_images": MAX_BATCH_IMAGES,
     }
 
 
-@app.post("/extract", response_model=ExtractOut)
-async def extract(image: UploadFile = File(...)) -> ExtractOut:  # noqa: B008
-    if not _extractor.loaded:
-        raise HTTPException(status_code=503, detail="模型尚未加载完成")
-
-    payload = await image.read()
-    if not payload:
-        raise HTTPException(status_code=400, detail="空文件")
-    if len(payload) > MAX_IMAGE_BYTES:
-        raise HTTPException(status_code=413, detail="图片过大")
-
-    started = time.perf_counter()
-    async with _inference_slots:
-        try:
-            # to_thread 是关键：ONNXRuntime 推理是同步阻塞的，直接在 event loop 里跑
-            # 会让整个服务在并发下卡死。
-            outcome = await asyncio.to_thread(_extractor.extract, payload)
-        except Exception as exc:
-            log.warning("extract_failed", error_type=type(exc).__name__)
-            raise HTTPException(status_code=422, detail="图片无法解析") from exc
-    latency_ms = int((time.perf_counter() - started) * 1000)
-
-    # 只记计数与耗时，绝不记向量或图片
-    log.info(
-        "extract_done",
-        faces=len(outcome.faces),
-        discarded=outcome.discarded,
-        latency_ms=latency_ms,
-    )
-
-    return ExtractOut(
+def _to_image_result(outcome: ExtractOutcome) -> ImageResult:
+    return ImageResult(
         faces=[
             FaceOut(
                 bbox=list(f.bbox),
@@ -123,7 +132,97 @@ async def extract(image: UploadFile = File(...)) -> ExtractOut:  # noqa: B008
         discarded=outcome.discarded,
         image_width=outcome.image_width,
         image_height=outcome.image_height,
+        error=outcome.error,
+    )
+
+
+async def _read_upload(upload: UploadFile) -> bytes:
+    payload = await upload.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="空文件")
+    if len(payload) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="图片过大")
+    return payload
+
+
+@app.post("/extract", response_model=ExtractOut)
+async def extract(image: UploadFile = File(...)) -> ExtractOut:  # noqa: B008
+    """单张。在线检索走这个 —— 延迟优先。"""
+    if not _extractor.loaded:
+        raise HTTPException(status_code=503, detail="模型尚未加载完成")
+
+    payload = await _read_upload(image)
+
+    started = time.perf_counter()
+    async with _inference_slots:
+        # to_thread 是关键：推理是同步阻塞的，直接在 event loop 里跑
+        # 会让整个服务在并发下卡死。
+        outcome = await asyncio.to_thread(_extractor.extract, payload)
+    latency_ms = int((time.perf_counter() - started) * 1000)
+
+    if outcome.error is not None:
+        raise HTTPException(status_code=422, detail="图片无法解析")
+
+    # 只记计数与耗时，绝不记向量或图片
+    log.info(
+        "extract_done",
+        faces=len(outcome.faces),
+        discarded=outcome.discarded,
+        latency_ms=latency_ms,
+    )
+
+    base = _to_image_result(outcome)
+    return ExtractOut(
+        **base.model_dump(),
         model_name=MODEL_NAME,
         model_version=MODEL_VERSION,
         latency_ms=latency_ms,
+    )
+
+
+@app.post("/extract/batch", response_model=BatchExtractOut)
+async def extract_batch(images: list[UploadFile] = File(...)) -> BatchExtractOut:  # noqa: B008
+    """批量。离线建库走这个 —— 吞吐优先。
+
+    整批照片里所有对齐后的人脸会拼成一个 batch 做一次识别前向，这是 GPU 利用率
+    提升最大的一处。单张解码失败不影响同批其他图片，对应位置的 error 非空。
+    """
+    if not _extractor.loaded:
+        raise HTTPException(status_code=503, detail="模型尚未加载完成")
+    if not images:
+        raise HTTPException(status_code=400, detail="没有收到图片")
+    if len(images) > MAX_BATCH_IMAGES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"单次批量最多 {MAX_BATCH_IMAGES} 张，收到 {len(images)} 张",
+        )
+
+    payloads = [await _read_upload(image) for image in images]
+
+    started = time.perf_counter()
+    async with _inference_slots:
+        outcomes = await asyncio.to_thread(_extractor.extract_batch, payloads)
+    latency_ms = int((time.perf_counter() - started) * 1000)
+
+    results = [_to_image_result(o) for o in outcomes]
+    faces_total = sum(len(r.faces) for r in results)
+
+    log.info(
+        "extract_batch_done",
+        images=len(results),
+        faces=faces_total,
+        discarded=sum(r.discarded for r in results),
+        failed=sum(1 for r in results if r.error),
+        latency_ms=latency_ms,
+        per_image_ms=latency_ms // max(1, len(results)),
+        batched=_extractor.batch_supported,
+    )
+
+    return BatchExtractOut(
+        results=results,
+        model_name=MODEL_NAME,
+        model_version=MODEL_VERSION,
+        latency_ms=latency_ms,
+        faces_total=faces_total,
+        batched=_extractor.batch_supported,
     )

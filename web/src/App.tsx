@@ -1,6 +1,15 @@
 import { useCallback, useEffect, useState } from 'react'
 
-import { ApiError, checkSession, logout, search, type SearchResponse } from './api'
+import {
+  ApiError,
+  type Album,
+  checkSession,
+  listAlbums,
+  logout,
+  search,
+  type SearchResponse,
+} from './api'
+import { AlbumFilter } from './components/AlbumFilter'
 import { EmptyState } from './components/EmptyState'
 import { InviteGate } from './components/InviteGate'
 import { Lightbox } from './components/Lightbox'
@@ -11,6 +20,8 @@ type AuthState = 'checking' | 'anonymous' | 'authenticated'
 
 export function App() {
   const [auth, setAuth] = useState<AuthState>('checking')
+  const [albums, setAlbums] = useState<Album[]>([])
+  const [album, setAlbum] = useState('')
   const [selfies, setSelfies] = useState<SelfieItem[]>([])
   const [result, setResult] = useState<SearchResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -22,11 +33,22 @@ export function App() {
     void checkSession().then((ok) => setAuth(ok ? 'authenticated' : 'anonymous'))
   }, [])
 
+  useEffect(() => {
+    if (auth !== 'authenticated') return
+    // 相册列表拿不到不影响主流程（默认「所有活动」），所以失败静默
+    void listAlbums()
+      .then(setAlbums)
+      .catch(() => setAlbums([]))
+  }, [auth])
+
   const runSearch = useCallback(async () => {
     setPending(true)
     setError(null)
     try {
-      const response = await search(selfies.map((item) => item.file))
+      const response = await search(
+        selfies.map((item) => item.file),
+        album || undefined,
+      )
       setResult(response)
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
@@ -37,7 +59,7 @@ export function App() {
     } finally {
       setPending(false)
     }
-  }, [selfies])
+  }, [selfies, album])
 
   function reset() {
     for (const item of selfies) URL.revokeObjectURL(item.previewUrl)
@@ -78,6 +100,9 @@ export function App() {
         onChange={setSelfies}
         onSubmit={() => void runSearch()}
         pending={pending}
+        albumFilter={
+          <AlbumFilter albums={albums} value={album} onChange={setAlbum} disabled={pending} />
+        }
       />
 
       {error && (

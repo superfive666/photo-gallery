@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import time
 
-from fastapi import APIRouter, File, UploadFile
+from fastapi import APIRouter, File, Form, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,7 +18,7 @@ from api.app.services.search import search_by_embedding
 from gallery_core.config import Settings
 from gallery_core.embedding_client import EmbeddingServiceError
 from gallery_core.logging import get_logger
-from gallery_core.models import SearchAudit
+from gallery_core.models import ALBUM_MAX_LEN, SearchAudit
 from gallery_core.vector import mean_embedding
 
 log = get_logger(__name__)
@@ -27,10 +27,7 @@ router = APIRouter(prefix="/search", tags=["search"])
 
 class MatchOut(BaseModel):
     photo_id: str
-    album_id: str
-    album_name: str
-    filename: str
-    taken_at: str | None
+    album: str
     score: float
     thumb_url: str | None
     original_url: str
@@ -54,12 +51,16 @@ async def search(
     limiters: LimitersDep,
     ip: ClientIpDep,
     selfies: list[UploadFile] = File(...),  # noqa: B008
+    # 只在某个相册里找。带上它会被分区裁剪成单分区检索 —— 更快也更精确。
+    album: str | None = Form(default=None),
 ) -> SearchOut:
     from api.app.uploads import read_selfie, validate_count
 
     started = time.perf_counter()
 
     validate_count(selfies, settings)
+    album_filter = _normalize_album(album)
+
     session_limiter, ip_limiter = limiters
     session_limiter.check(f"search:{session}")
     ip_limiter.check(f"search:{ip}")
@@ -88,7 +89,7 @@ async def search(
     latency_ms = int((time.perf_counter() - started) * 1000)
 
     if not vectors:
-        await _audit(db, session, ip, settings, faces_detected, 0, 0, latency_ms)
+        await _audit(db, session, ip, settings, album_filter, faces_detected, 0, 0, latency_ms)
         return SearchOut(
             matches=[],
             faces_detected=0,
@@ -98,7 +99,7 @@ async def search(
         )
 
     query_vec = mean_embedding(vectors).tolist()
-    outcome = await search_by_embedding(db, query_vec, settings)
+    outcome = await search_by_embedding(db, query_vec, settings, album=album_filter)
     latency_ms = int((time.perf_counter() - started) * 1000)
 
     await _audit(
@@ -106,6 +107,7 @@ async def search(
         session,
         ip,
         settings,
+        album_filter,
         faces_detected,
         outcome.person_candidates,
         len(outcome.matches),
@@ -115,12 +117,9 @@ async def search(
     matches = [
         MatchOut(
             photo_id=str(m.photo_id),
-            album_id=str(m.album_id),
-            album_name=m.album_name,
-            filename=m.filename,
-            taken_at=m.taken_at,
+            album=m.album,
             score=round(m.score, 4),
-            thumb_url=f"/api/photos/{m.photo_id}/thumb" if m.has_thumb else None,
+            thumb_url=f"/api/photos/{m.photo_id}/thumb" if m.has_thumbnail else None,
             original_url=f"/api/photos/{m.photo_id}/original",
         )
         for m in outcome.matches
@@ -129,6 +128,7 @@ async def search(
     # 只记计数与耗时
     log.info(
         "search_done",
+        album=album_filter,
         faces_detected=faces_detected,
         person_candidates=outcome.person_candidates,
         results=len(matches),
@@ -146,11 +146,22 @@ async def search(
     )
 
 
+def _normalize_album(album: str | None) -> str | None:
+    """空字符串按「不筛选」处理 —— 表单里没选相册时浏览器会送空串而不是省略字段。"""
+    if album is None:
+        return None
+    trimmed = album.strip()
+    if not trimmed:
+        return None
+    return trimmed[:ALBUM_MAX_LEN]
+
+
 async def _audit(
     db: AsyncSession,
     session: str,
     ip: str,
     settings: Settings,
+    album: str | None,
     faces_detected: int,
     candidates: int,
     results: int,
@@ -161,6 +172,7 @@ async def _audit(
         SearchAudit(
             session_hash=audit_hash(session, settings),
             ip_hash=audit_hash(ip, settings),
+            album_filter=album,
             faces_detected=faces_detected,
             candidate_count=candidates,
             result_count=results,

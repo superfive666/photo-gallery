@@ -11,7 +11,8 @@
 五个容器，`docker compose` 编排：
 
 - `db` — Postgres 16 + pgvector，唯一状态所在地
-- `embedding` — FastAPI + InsightFace buffalo_l（ONNXRuntime CPU），**唯一**做人脸检测/embedding 的地方
+- `embedding` — FastAPI + InsightFace buffalo_l（ONNXRuntime，CPU 或 CUDA），**唯一**做人脸
+  检测/embedding 的地方。`/extract` 单张（在线检索）、`/extract/batch` 批量（离线建库）
 - `api` — FastAPI，鉴权 + 检索 + 缩略图分发，不含模型
 - `web` — nginx 托管 Vite 构建产物
 - `jobs` — 一次性容器 / cron 触发，离线建库
@@ -31,9 +32,12 @@
 5. **每条 face 记录必须带 `model_name` / `model_version` / `dim`。**
    换模型时靠这几个字段识别存量数据并重算，而不是整库作废。
 6. **DDL 只以追加方式演进。** 新增 `docs/schema/NNN_*.sql`，绝不原地修改已发布的迁移文件。
-7. **返回给前端的原图链接必须是短效签名 URL**，不得直出原站裸地址 —— 那会绕过 photos.zrc.sg 的
-   访问控制，把 private album 泄露出去。
-8. **self-hosted runner 上不得因 fork PR 而执行不受信任的代码。** 见 `docs/cicd.md`。
+7. **所有针对 `face` 表的查询/DML 都必须带上 `album` 条件**（除了故意的全库检索）。
+   `face` 按 `album` 做 LIST 分区，少了这个条件就会扫描全部分区 —— 不会报错，只是慢，
+   所以极容易在 review 时被放过。见 `docs/schema/README.md`。
+8. **先建分区、再插数据。** 某个 album 的行一旦落进 `face_default`，之后就无法再为它
+   建专属分区（Postgres 会拒绝）。`pipeline` 的顺序不能颠倒。
+9. **self-hosted runner 上不得因 fork PR 而执行不受信任的代码。** 见 `docs/cicd.md`。
 
 ## 常用命令
 
@@ -41,7 +45,8 @@
 make help          # 全部命令
 make up / down     # 起停 compose
 make migrate       # 顺序执行 docs/schema/*.sql
-make ingest ALBUM=x# 手动跑一次离线建库
+make probe ALBUM=x  # 探查源站页面结构，不写库
+make ingest ALBUM=x # 批量离线建库
 make cluster       # 重跑 person 聚类
 make test          # api + jobs 的 pytest，web 的 vitest
 make lint          # ruff + mypy + eslint + prettier
@@ -64,10 +69,22 @@ make eval          # 跑阈值评估集，输出 precision/recall
 3. 实现 + 测试。
 4. 更新 README「已知局限」与相关文档。
 
+## 数据模型速览
+
+两张主表。一张合影有多个人 → 一条 photo 对应多条 face，这是分表的原因。
+
+- `photo` — `id`(uuidv7) / `album` / `photo_url`(唯一，幂等键) / `thumbnail`(BYTEA)
+- `face` — `id`(uuidv7) / `photo_id` / `album` / `embedding(512)`，**按 album LIST 分区**，
+  PK 是 `(album, id)`
+
+`album` 就是源站 URL 里那段 slug（`/album/2026-08-10`），不是外键，没有 album 表。
+
 ## 当前未决问题
 
-- **photos.zrc.sg 是自建/静态相册**，抓取方式尚未确定。所有源站相关逻辑都隔离在
-  `jobs/sources/` 的 `SourceAdapter` 协议之后，`static_gallery.py` 目前是待填充的占位实现。
-  在拿到真实的目录结构 / 索引接口 / 鉴权方式之前，不要把源站细节泄漏到 `jobs/pipeline.py` 以外。
+- **photos.zrc.sg 的相册页标记结构未确认。** 站点本身已确认是公开无鉴权、
+  地址形如 `/album/<slug>`。`static_gallery.py` 里现在是按优先级依次尝试的通用解析
+  （JSON 索引 → `<a href>` → `<img src>`）。
+  **下一步跑 `make probe ALBUM=2026-08-10`**，拿到真实输出后收敛成精确选择器。
   详见 [`docs/data-source.md`](docs/data-source.md)。
 - 相似度阈值需要用真实数据标定，当前默认值只是文献经验值。见 `docs/evaluation.md`。
+- 分区方案的取舍已记录在 `docs/schema/README.md`「分区的代价」—— 相册数到千级时要重新评估。

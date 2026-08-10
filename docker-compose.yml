@@ -25,6 +25,10 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.embedding
+      args:
+        # CPU 版用 onnxruntime；有 NVIDIA GPU 时改成 onnxruntime-gpu 并设
+        # EMBEDDING_USE_GPU=true（还需要 nvidia container runtime）。见 docker/README.md。
+        ORT_PACKAGE: ${ORT_PACKAGE:-onnxruntime}
     restart: unless-stopped
     environment:
       MODEL_NAME: ${MODEL_NAME}
@@ -32,6 +36,9 @@ services:
       ORT_NUM_THREADS: ${ORT_NUM_THREADS}
       MIN_DET_SCORE: ${MIN_DET_SCORE}
       MIN_FACE_PX: ${MIN_FACE_PX}
+      EMBEDDING_USE_GPU: ${EMBEDDING_USE_GPU:-false}
+      REC_BATCH_SIZE: ${REC_BATCH_SIZE:-64}
+      MAX_BATCH_IMAGES: ${MAX_BATCH_IMAGES:-32}
       LOG_LEVEL: ${LOG_LEVEL}
     expose:
       - "8000"
@@ -40,7 +47,7 @@ services:
       resources:
         limits:
           cpus: "${EMBEDDING_CPU_LIMIT:-4}"
-          memory: 4g
+          memory: 8g
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz', timeout=5).status==200 else 1)"]
       interval: 15s
@@ -99,10 +106,7 @@ services:
       # local_dir adapter 与评估集的输入目录
       - ${SOURCE_LOCAL_DIR:-./sample-albums}:/data/sample-albums:ro
       - ${EVAL_DIR:-./eval}:/data/eval:ro
-    # 原图流式下载的临时目录：内存盘，且强制小容量，
-    # 从物理上保证「处理完即删」的纪律不被违反、磁盘不被打满
-    tmpfs:
-      - /tmp/ingest:size=2g
+      # 原图不落盘：批量推理把字节留在内存里，处理完即释放。所以这里没有原图缓存卷。
 
 volumes:
   pgdata:

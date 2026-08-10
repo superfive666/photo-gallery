@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from api.app.rate_limit import SlidingWindowLimiter
-from api.app.routers import health, photos, search, session
+from api.app.routers import albums, health, photos, search, session
 from gallery_core.config import get_settings
 from gallery_core.embedding_client import EmbeddingClient
 from gallery_core.logging import configure_logging, get_logger
@@ -59,5 +59,6 @@ app = FastAPI(
 # 全部业务路由挂在 /api 下，与 nginx 的反代前缀一致
 app.include_router(health.router)
 app.include_router(session.router, prefix="/api")
+app.include_router(albums.router, prefix="/api")
 app.include_router(search.router, prefix="/api")
 app.include_router(photos.router, prefix="/api")

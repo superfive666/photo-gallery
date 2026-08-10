@@ -51,12 +51,16 @@ backup: ## 导出数据库到 ./backups/
 # ---------------------------------------------------------------------------
 # 离线任务
 # ---------------------------------------------------------------------------
+.PHONY: probe
+probe: ## 探查源站页面结构，不写库。用法：make probe ALBUM=2026-08-10
+	$(COMPOSE) run --rm jobs python -m jobs probe $(if $(ALBUM),--album $(ALBUM),)
+
 .PHONY: ingest
-ingest: ## 拉取并建库。用法：make ingest ALBUM=<id>（省略则全部）
+ingest: ## 拉取并建库（批量）。用法：make ingest ALBUM=2026-08-10（省略则全部）
 	$(COMPOSE) run --rm jobs python -m jobs ingest $(if $(ALBUM),--album $(ALBUM),)
 
 .PHONY: ingest-full
-ingest-full: ## 全量重跑（忽略 checksum 缓存）
+ingest-full: ## 全量重跑（忽略已入库记录）
 	$(COMPOSE) run --rm jobs python -m jobs ingest --full $(if $(ALBUM),--album $(ALBUM),)
 
 .PHONY: cluster
