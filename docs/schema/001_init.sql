@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 --
 -- 为什么不用 gen_random_uuid()（v4）：v4 完全随机，插入位置在 B-tree 里到处跳，
 -- 大批量入库时页分裂严重、缓存命中率低、索引膨胀。v7 前 48 位是 Unix 毫秒时间戳，
--- 天然按时间单调递增，插入始终落在索引右端 —— 离线建库是「一次灌很多」的场景，
+-- 天然按时间递增，插入始终落在索引右端 —— 离线建库是「一次灌很多」的场景，
 -- 这个差别很实际。
 --
 -- PostgreSQL 18 起内置 uuidv7()。这里自己实现一份，使 pg16/17 也能用，
@@ -54,17 +54,14 @@ $$;
 -- ---------------------------------------------------------------------------
 -- photo — 源站的一张照片/一个视频
 --
--- album 在这张表上只做索引，不分区（分区在 face 上）。
---
--- ⚠️ album 列显式指定 COLLATE "C"：分区键的比较依赖排序规则，而 face.album 是分区键。
--- 两张表用同一个排序规则，才不会在 JOIN/比较时出现「无法确定使用哪个 collation」的错误，
--- 也让分区路由的行为与 locale 无关、可预测。
+-- album 只属于 photo：一张照片属于哪个相册是照片自己的属性，与它上面有几张脸无关。
+-- face 通过 photo_id 外键间接得到 album，不再冗余存一份。
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS photo (
     id                  UUID            PRIMARY KEY DEFAULT uuid_generate_v7(),
 
     -- URL friendly 的相册标识，形如 '2026-08-10'（对应 photos.zrc.sg/album/2026-08-10）
-    album               VARCHAR(200) COLLATE "C" NOT NULL,
+    album               VARCHAR(200)    NOT NULL,
 
     -- 原图（original quality）的完整下载地址。源站公开无鉴权，可直接给前端用。
     -- 同时作为幂等写入的唯一键：ON CONFLICT (photo_url) DO UPDATE。
@@ -103,46 +100,15 @@ CREATE INDEX IF NOT EXISTS photo_album_idx  ON photo (album) WHERE deleted_at IS
 CREATE INDEX IF NOT EXISTS photo_status_idx ON photo (processing_status) WHERE deleted_at IS NULL;
 
 -- ---------------------------------------------------------------------------
--- person — 人脸聚类得到的簇。不分区（跨相册），不承载真实身份。
---
--- 两段式检索的第一段就是对 centroid 做 KNN：簇心是同一人多张样本（正脸/侧脸/不同光照）
--- 的均值，比任何单张照片都更接近这个人的「平均长相」，对查询自拍的角度差异更鲁棒。
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS person (
-    id                  UUID        PRIMARY KEY DEFAULT uuid_generate_v7(),
-    label               TEXT,                      -- 可选人工标注，默认永远 NULL
-    centroid            VECTOR(512) NOT NULL,
-    face_count          INTEGER     NOT NULL DEFAULT 0,
-    model_name          TEXT        NOT NULL,
-    model_version       TEXT        NOT NULL,
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS person_centroid_hnsw
-    ON person USING hnsw (centroid vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);
-
--- ---------------------------------------------------------------------------
 -- face — 向量主表。一张脸一行；十人合影 = 1 条 photo + 10 条 face。
 --
--- 按 album 做 LIST 分区，使「只在某个相册里找」能被分区裁剪成单分区精确检索。
---
--- ⚠️ 分区表的主键必须包含分区键，所以 PK 是 (album, id) 而不是 (id)。
---    album 放在前面，让 PK 索引同时能服务按相册的前缀查找。
---    代价：id 的全局唯一性不由数据库保证（只保证 (album, id) 唯一）。
---    uuidv7 的碰撞概率可忽略，且我们从不用「只给 id 不给 album」的方式查 face。
---
--- ⚠️ 全库检索（主流程：上传自拍找所有相册）不会被分区裁剪，必须对每个分区各做一次
---    HNSW 索引扫描再 MergeAppend。相册数量上到千级时这个开销会变得明显。
---    规模与退出路径见 docs/schema/README.md「分区的代价」。
+-- 普通表，不分区。这个量级（十万级向量）单个 HNSW 索引的 KNN 就是毫秒级，
+-- 按 album 分区只会让「查所有相册」这个主流程变成对 N 个分区各扫一次再归并。
+-- 取舍过程记录在 docs/plans/0003-drop-partition-and-person.md。
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS face (
-    id                  UUID            NOT NULL DEFAULT uuid_generate_v7(),
-    -- 外键指向未分区的 photo，PG12+ 支持分区表引用普通表
+    id                  UUID            PRIMARY KEY DEFAULT uuid_generate_v7(),
     photo_id            UUID            NOT NULL REFERENCES photo(id) ON DELETE CASCADE,
-    -- 与 photo.album 同义。冗余存一份是分区的前提 —— 分区键必须在本表上。
-    album               VARCHAR(200) COLLATE "C" NOT NULL,
 
     -- L2 归一化后的 embedding，索引用 vector_cosine_ops。
     -- 归一化统一在 embedding 服务出口完成，下游不再动。
@@ -156,102 +122,60 @@ CREATE TABLE IF NOT EXISTS face (
     face_px             INTEGER         NOT NULL,   -- least(bbox_w, bbox_h)
     det_score           REAL            NOT NULL,
 
-    -- 聚类结果。ON DELETE SET NULL：重聚类时先清 person，face 自动置空。
-    person_id           UUID            REFERENCES person(id) ON DELETE SET NULL,
-
     -- 模型溯源。换模型时靠这三列识别存量数据并增量重算，而不是整库作废。
     model_name          TEXT            NOT NULL,
     model_version       TEXT            NOT NULL,
     dim                 INTEGER         NOT NULL DEFAULT 512,
 
-    created_at          TIMESTAMPTZ     NOT NULL DEFAULT now(),
+    created_at          TIMESTAMPTZ     NOT NULL DEFAULT now()
+);
 
-    PRIMARY KEY (album, id)
-) PARTITION BY LIST (album);
+CREATE INDEX IF NOT EXISTS face_photo_idx ON face (photo_id);
+CREATE INDEX IF NOT EXISTS face_model_idx ON face (model_name, model_version);
 
--- 兜底分区：接收还没有专属分区的相册（以及非日期形式的 album）。
--- ⚠️ 如果某个 album 的行已经落进 DEFAULT，之后再为它建专属分区会失败
---    （PG 要求扫描 DEFAULT 分区且不允许存在冲突行）。所以 pipeline 的顺序是
---    「先建分区、再插数据」。恢复办法见 docs/schema/README.md。
-CREATE TABLE IF NOT EXISTS face_default PARTITION OF face DEFAULT;
-
--- 在父表上建索引，Postgres 会为每个现有分区建本地索引，
--- 之后新建的分区也会自动继承 —— 所以运行时加分区不需要额外建索引。
+-- HNSW 而非 IVFFlat：无需预训练、召回更高、增量插入友好。
+-- IVFFlat 需要有代表性的数据才能建好 list，在边灌边查的场景下不稳。需 pgvector >= 0.5。
 CREATE INDEX IF NOT EXISTS face_embedding_hnsw
     ON face USING hnsw (embedding vector_cosine_ops)
     WITH (m = 16, ef_construction = 64);
 
-CREATE INDEX IF NOT EXISTS face_photo_idx  ON face (photo_id);
-CREATE INDEX IF NOT EXISTS face_person_idx ON face (person_id);
-CREATE INDEX IF NOT EXISTS face_model_idx  ON face (model_name, model_version);
-
--- ---------------------------------------------------------------------------
--- ensure_face_partition — 为一个 album 建专属分区（幂等、并发安全）
---
--- jobs 在处理某个相册的第一张照片之前调用它。分区名不能直接用 album：
--- album 允许 200 字符，而 PG 标识符上限 63 字节。所以用「净化后的前缀 + md5 短哈希」，
--- 既可读又不会撞名、不会超长。
--- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION ensure_face_partition(p_album TEXT)
-RETURNS TEXT
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    slug       TEXT;
-    part_name  TEXT;
-BEGIN
-    IF p_album IS NULL OR p_album = '' THEN
-        RAISE EXCEPTION 'album 不能为空';
-    END IF;
-
-    slug := left(regexp_replace(lower(p_album), '[^a-z0-9]+', '_', 'g'), 38);
-    part_name := 'face_p_' || slug || '_' || left(md5(p_album), 8);
-
-    BEGIN
-        EXECUTE format(
-            'CREATE TABLE %I PARTITION OF face FOR VALUES IN (%L)',
-            part_name, p_album
-        );
-    EXCEPTION
-        -- 分区已存在（本进程之前建过，或并发的另一个 ingest 先建了）
-        WHEN duplicate_table THEN NULL;
-        -- 另一个事务正在建同名分区
-        WHEN unique_violation THEN NULL;
-    END;
-
-    RETURN part_name;
-END;
-$$;
-
 -- ---------------------------------------------------------------------------
 -- block_list — opt-out。检索时在 SQL 层过滤，不在应用层结果集里过滤
 -- （后者容易在新增查询路径时被漏掉，导致 opt-out 静默失效）。
+--
+-- 两种粒度：
+--   · face  —— 某个人不希望被检索到。管理员用他的自拍跑一次检索，把命中的 face 全部
+--              加进来。之后这些 face 不再参与匹配，只有他出现的照片也就不再被搜出。
+--   · photo —— 整张照片不希望出现在结果里。
+--
+-- 没有 person 表，所以「屏蔽某个人」= 屏蔽他的那一批 face。
+-- 用 `jobs block --selfie <路径>` 一条命令完成，见 docs/privacy.md。
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS block_list (
     id                  UUID        PRIMARY KEY DEFAULT uuid_generate_v7(),
-    scope               TEXT        NOT NULL CHECK (scope IN ('person', 'photo')),
-    person_id           UUID        REFERENCES person(id) ON DELETE CASCADE,
-    photo_id            UUID        REFERENCES photo(id)  ON DELETE CASCADE,
+    scope               TEXT        NOT NULL CHECK (scope IN ('face', 'photo')),
+    face_id             UUID        REFERENCES face(id)  ON DELETE CASCADE,
+    photo_id            UUID        REFERENCES photo(id) ON DELETE CASCADE,
     reason              TEXT,
     created_by          TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT block_list_target_ck CHECK (
-        (scope = 'person' AND person_id IS NOT NULL AND photo_id IS NULL) OR
-        (scope = 'photo'  AND photo_id  IS NOT NULL AND person_id IS NULL)
+        (scope = 'face'  AND face_id  IS NOT NULL AND photo_id IS NULL) OR
+        (scope = 'photo' AND photo_id IS NOT NULL AND face_id  IS NULL)
     )
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS block_list_person_uq ON block_list (person_id)
-    WHERE person_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS block_list_photo_uq  ON block_list (photo_id)
+CREATE UNIQUE INDEX IF NOT EXISTS block_list_face_uq  ON block_list (face_id)
+    WHERE face_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS block_list_photo_uq ON block_list (photo_id)
     WHERE photo_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
 -- album_sync_state — 按 album 记录同步进度，支撑增量
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS album_sync_state (
-    album               VARCHAR(200) COLLATE "C" PRIMARY KEY,
+    album               VARCHAR(200) PRIMARY KEY,
     last_synced_at      TIMESTAMPTZ,
     last_full_sync_at   TIMESTAMPTZ,
     photo_count         INTEGER     NOT NULL DEFAULT 0,
@@ -263,8 +187,8 @@ CREATE TABLE IF NOT EXISTS album_sync_state (
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS job_run (
     id                  UUID        PRIMARY KEY DEFAULT uuid_generate_v7(),
-    kind                TEXT        NOT NULL CHECK (kind IN ('ingest', 'cluster', 'recompute')),
-    album               VARCHAR(200) COLLATE "C",
+    kind                TEXT        NOT NULL CHECK (kind IN ('ingest', 'recompute')),
+    album               VARCHAR(200),
     status              TEXT        NOT NULL DEFAULT 'running'
                                     CHECK (status IN ('running', 'succeeded', 'failed')),
     started_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -277,13 +201,15 @@ CREATE INDEX IF NOT EXISTS job_run_kind_started_idx ON job_run (kind, started_at
 
 -- ---------------------------------------------------------------------------
 -- search_audit — 检索留痕。只有计数与耗时。
--- 绝不存图片、向量、或任何可还原查询人脸的数据。
+--
+-- 用户上传的自拍在请求结束时即从内存中销毁，不落盘不落库 —— 这张表里
+-- 绝不允许出现图片、向量、或任何可还原查询人脸的数据。
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS search_audit (
     id                  BIGSERIAL   PRIMARY KEY,
     session_hash        TEXT        NOT NULL,      -- 带盐 hash，不存原值
     ip_hash             TEXT        NOT NULL,
-    album_filter        VARCHAR(200) COLLATE "C",  -- 本次是否限定了相册
+    album_filter        VARCHAR(200),              -- 本次是否限定了相册
     faces_detected      INTEGER     NOT NULL DEFAULT 0,
     candidate_count     INTEGER     NOT NULL DEFAULT 0,
     result_count        INTEGER     NOT NULL DEFAULT 0,

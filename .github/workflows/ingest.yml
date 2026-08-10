@@ -57,19 +57,11 @@ jobs:
           if [ "${{ inputs.full }}" = "true" ]; then args="$args --full"; fi
           docker compose run --rm jobs python -m jobs ingest $args | tee ingest-report.json
 
-      # 新照片会产生新的 face，簇必须跟着更新，否则新人搜不到。
-      # 即使 ingest 部分失败也要跑 —— 已入库的那部分同样需要聚类。
-      - name: 重跑聚类
-        if: always() && steps.ingest.outcome != 'skipped'
-        run: docker compose run --rm jobs python -m jobs cluster | tee cluster-report.json
-
       - name: 上传报告
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ingest-report-${{ github.run_number }}
-          path: |
-            ingest-report.json
-            cluster-report.json
+          path: ingest-report.json
           retention-days: 30
           if-no-files-found: warn

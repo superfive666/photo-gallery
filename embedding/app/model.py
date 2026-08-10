@@ -77,6 +77,16 @@ class _Detection:
     crop: NDArray[np.uint8]
 
 
+def _most_prominent(detections: list[_Detection]) -> _Detection:
+    """挑出「最明显」的那张脸。
+
+    判据是人脸框面积，det_score 作为并列时的次序 —— 自拍里本人的脸几乎总是画面中
+    最大的那张，面积是最稳也最好解释的信号。刻意不引入更复杂的打分（清晰度、
+    居中程度）：这个选择直接决定查询结果，规则越简单越容易在出问题时说清原因。
+    """
+    return max(detections, key=lambda d: (d.bbox[2] * d.bbox[3], d.det_score))
+
+
 class FaceExtractor:
     """常驻内存的模型。进程启动时加载一次，绝不按请求加载。"""
 
@@ -175,12 +185,18 @@ class FaceExtractor:
 
     # ------------------------------------------------------------------ 推理
 
-    def extract(self, image_bytes: bytes) -> ExtractOutcome:
+    def extract(self, image_bytes: bytes, primary_only: bool = False) -> ExtractOutcome:
         """单张。同步、CPU/GPU 密集，调用方必须丢到 threadpool。"""
-        return self.extract_batch([image_bytes])[0]
+        return self.extract_batch([image_bytes], primary_only=primary_only)[0]
 
-    def extract_batch(self, images: list[bytes]) -> list[ExtractOutcome]:
+    def extract_batch(
+        self, images: list[bytes], primary_only: bool = False
+    ) -> list[ExtractOutcome]:
         """一批图片。返回值与入参一一对应、顺序一致。
+
+        `primary_only=True` 时每张图只保留**最明显的一张脸**，用于查询自拍：
+        用户要找的是自己，背景里的路人不该参与匹配。筛选发生在识别前向之前，
+        所以其余人脸根本不会被向量化 —— 既省算力，也让离开本服务的人脸数据最少化。
 
         单张失败（解码错误、损坏文件）不会影响同批其他图片 —— 该位置返回带 error
         的空结果，调用方据此把那一张标成 failed。
@@ -197,7 +213,8 @@ class FaceExtractor:
         # ② 把整批的人脸裁剪拼成一个大 batch，做识别前向
         detections: list[_Detection] = []
         for index, (_, dets) in enumerate(per_image):
-            for det in dets:
+            kept = [_most_prominent(dets)] if primary_only and dets else dets
+            for det in kept:
                 det.image_index = index
                 detections.append(det)
         embeddings = self._embed_crops([d.crop for d in detections])

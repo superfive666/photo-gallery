@@ -43,15 +43,13 @@ class Settings(BaseSettings):
     # --- 检索阈值 ---
     # ⚠️ 以下默认值是文献经验值，不是本项目的标定结果。见 docs/evaluation.md。
     face_match_threshold: float = 0.42
-    person_match_threshold: float = 0.38
     min_det_score: float = 0.50
     min_face_px: int = 40
     max_results: int = 200
     hnsw_ef_search: int = 100
-
-    # --- 聚类 ---
-    cluster_min_samples: int = 3
-    cluster_eps: float = 0.30
+    # 从 HNSW 索引里取多少个最近邻作为候选，再按阈值过滤。
+    # 这是召回上限：一个人在库里的照片数超过它就会少返结果。见 api/app/services/search.py。
+    search_candidates: int = 500
 
     # --- 鉴权 ---
     # 这些占位值只为本地开发方便。带着它们上生产等于没有鉴权：

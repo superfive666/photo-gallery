@@ -6,8 +6,8 @@
 - 照片和视频按预先归纳好的 album 分组。
 - 相册地址：`https://photos.zrc.sg/album/<slug>`，例如
   [`/album/2026-08-10`](https://photos.zrc.sg/album/2026-08-10)。
-- **slug 直接就是数据库里的 `album` 字段**（`VARCHAR(200) COLLATE "C"`），
-  也是 `face` 表的分区键。不再需要额外的 album 元数据表 —— slug 本身即业务标识。
+- **slug 直接就是数据库里的 `album` 字段**（`VARCHAR(200)`，只在 `photo` 表上）。
+  不需要额外的 album 元数据表 —— slug 本身即业务标识。
 - 幂等键是 `photo_url`（原图完整地址）。URL 在静态站点上稳定且天然唯一。
 
 因为源站公开，两件事被简化了：
@@ -51,8 +51,8 @@ make probe ALBUM=2026-08-10
 2. **缩略图**：源站是否为每张照片提供缩略图？提供的话直接落其字节（省一次本地重编码）；
    没有则由 `jobs/thumbnails.py` 从原图生成 256px WebP。
    probe 输出里的 `with_source_thumbnail` 会告诉我们答案。
-3. **规模**：总照片数量级？相册数量级？后者决定分区方案是否需要调整
-   （见 [`schema/README.md`](schema/README.md#分区的代价)）。
+3. **规模**：总照片数量级？这决定 `SEARCH_CANDIDATES`（默认 500，是召回上限）是否够用
+   —— 单个成员在库里的照片数超过它，结果就会被截断。
 4. **视频占比**：第一期不处理视频，但需要知道量级来决定第二期优先级。
    probe 输出里的 `videos` 会给出单个相册的情况。
 5. **变更检测**：当前策略是「这个 photo_url 成功入库过就跳过」。

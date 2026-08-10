@@ -3,9 +3,8 @@
 python -m jobs migrate
 python -m jobs probe  [--album 2026-08-10]        # 探查源站页面结构
 python -m jobs ingest [--album ID] [--full]
-python -m jobs cluster
 python -m jobs eval   [--dir /data/eval] [--sweep]
-python -m jobs block --person <uuid> | --photo <uuid> [--reason ...]
+python -m jobs block  --selfie <路径> | --face <uuid> | --photo <uuid> [--reason ...]
 """
 
 from __future__ import annotations
@@ -159,24 +158,6 @@ async def cmd_ingest(args: argparse.Namespace) -> int:
     return 1 if stats.failed else 0
 
 
-async def cmd_cluster(_args: argparse.Namespace) -> int:
-    from jobs.cluster import recluster
-
-    s = get_settings()
-    async with session_scope() as session:
-        stats = await recluster(session, s)
-    print(json.dumps(stats, ensure_ascii=False, indent=2))
-
-    noise_ratio = stats.get("noise_ratio")
-    if isinstance(noise_ratio, float) and noise_ratio > 0.4:
-        print(
-            f"\n提示：噪声点比例 {noise_ratio:.0%} 偏高。这些人脸不属于任何簇，"
-            f"只能靠检索的「直接命中」兜底。考虑调大 CLUSTER_EPS（当前 {s.cluster_eps}）。",
-            file=sys.stderr,
-        )
-    return 0
-
-
 async def cmd_eval(args: argparse.Namespace) -> int:
     """跑评估集，输出 precision/recall 与漏检归因。见 docs/evaluation.md。"""
     from jobs.eval import evaluate, sweep
@@ -208,15 +189,83 @@ async def cmd_eval(args: argparse.Namespace) -> int:
 
 
 async def cmd_block(args: argparse.Namespace) -> int:
-    """opt-out。第一期由管理员用 CLI 处理，不做自助 UI。"""
+    """opt-out。第一期由管理员用 CLI 处理，不做自助 UI。
+
+    没有 person 表，所以「屏蔽某个人」= 屏蔽他的那一批 face。
+    `--selfie` 就是为此存在的：用当事人的自拍跑一次检索，把命中的 face 全部屏蔽。
+    这条命令是幂等的，可以在新照片入库后重复运行。
+    """
     from sqlalchemy import text
 
-    if bool(args.person) == bool(args.photo):
-        print("必须且只能指定 --person 或 --photo 之一", file=sys.stderr)
+    from api.app.services.search import find_faces_for_blocking
+
+    given = [bool(args.selfie), bool(args.face), bool(args.photo)]
+    if sum(given) != 1:
+        print("必须且只能指定 --selfie / --face / --photo 之一", file=sys.stderr)
         return 2
 
-    scope = "person" if args.person else "photo"
-    target = args.person or args.photo
+    settings = get_settings()
+
+    if args.selfie:
+        selfie_path = Path(args.selfie)
+        if not await asyncio.to_thread(selfie_path.is_file):
+            print(f"找不到文件 {selfie_path}", file=sys.stderr)
+            return 2
+
+        async with EmbeddingClient() as embedding:
+            if not await embedding.healthy():
+                print("embedding 服务不可用，中止。", file=sys.stderr)
+                return 2
+            # 与线上检索完全一致：只取最明显的一张脸
+            result = await embedding.extract(
+                await asyncio.to_thread(selfie_path.read_bytes),
+                filename=selfie_path.name,
+                primary_only=True,
+            )
+
+        if not result.faces:
+            print("这张自拍里没检测到人脸，换一张正面清晰的。", file=sys.stderr)
+            return 1
+
+        async with session_scope() as session:
+            face_ids = await find_faces_for_blocking(
+                session, result.faces[0].embedding, settings, threshold=args.threshold
+            )
+            if not face_ids:
+                print(json.dumps({"blocked_faces": 0}, ensure_ascii=False))
+                return 0
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO block_list (scope, face_id, reason, created_by)
+                    SELECT 'face', CAST(fid AS uuid), :reason, :created_by
+                    FROM unnest(CAST(:ids AS text[])) AS fid
+                    ON CONFLICT DO NOTHING
+                    """
+                ),
+                {
+                    "ids": [str(fid) for fid in face_ids],
+                    "reason": args.reason or "opt-out via selfie",
+                    "created_by": args.by,
+                },
+            )
+        print(
+            json.dumps(
+                {
+                    "blocked_faces": len(face_ids),
+                    "threshold": args.threshold or settings.face_match_threshold,
+                },
+                ensure_ascii=False,
+            )
+        )
+        print(
+            "\n提示：这条命令只屏蔽了当前库里的人脸。之后有新相册入库时需要再跑一次。",
+            file=sys.stderr,
+        )
+        return 0
+
+    scope = "face" if args.face else "photo"
+    target = args.face or args.photo
     try:
         uuid.UUID(target)
     except ValueError:
@@ -227,22 +276,17 @@ async def cmd_block(args: argparse.Namespace) -> int:
         await session.execute(
             text(
                 """
-                INSERT INTO block_list (scope, person_id, photo_id, reason, created_by)
+                INSERT INTO block_list (scope, face_id, photo_id, reason, created_by)
                 VALUES (
                     :scope,
-                    CASE WHEN :scope = 'person' THEN CAST(:target AS uuid) END,
-                    CASE WHEN :scope = 'photo'  THEN CAST(:target AS uuid) END,
+                    CASE WHEN :scope = 'face'  THEN CAST(:target AS uuid) END,
+                    CASE WHEN :scope = 'photo' THEN CAST(:target AS uuid) END,
                     :reason, :created_by
                 )
                 ON CONFLICT DO NOTHING
                 """
             ),
-            {
-                "scope": scope,
-                "target": target,
-                "reason": args.reason,
-                "created_by": args.by,
-            },
+            {"scope": scope, "target": target, "reason": args.reason, "created_by": args.by},
         )
     print(f"已屏蔽 {scope} {target}")
     return 0
@@ -261,15 +305,17 @@ def main(argv: list[str] | None = None) -> int:
     p_ingest.add_argument("--album", help="只处理指定相册；省略则处理全部")
     p_ingest.add_argument("--full", action="store_true", help="忽略已入库记录，全部重新处理")
 
-    sub.add_parser("cluster", help="全量重跑 person 聚类")
-
     p_eval = sub.add_parser("eval", help="跑评估集，输出 precision/recall 与漏检归因")
     p_eval.add_argument("--dir", default="/data/eval", help="评估集目录")
     p_eval.add_argument("--sweep", action="store_true", help="在阈值网格上扫描并给出建议阈值")
 
-    p_block = sub.add_parser("block", help="把 person 或 photo 加入屏蔽名单（opt-out）")
-    p_block.add_argument("--person")
-    p_block.add_argument("--photo")
+    p_block = sub.add_parser("block", help="把人脸或照片加入屏蔽名单（opt-out）")
+    p_block.add_argument("--selfie", help="当事人的自拍路径：检索并屏蔽全部命中的人脸（推荐用法）")
+    p_block.add_argument("--face", help="直接屏蔽单个 face id")
+    p_block.add_argument("--photo", help="屏蔽整张照片")
+    p_block.add_argument(
+        "--threshold", type=float, default=None, help="--selfie 的匹配阈值，默认用检索阈值"
+    )
     p_block.add_argument("--reason", default=None)
     p_block.add_argument("--by", default="cli")
 
@@ -280,7 +326,6 @@ def main(argv: list[str] | None = None) -> int:
         "migrate": cmd_migrate,
         "probe": cmd_probe,
         "ingest": cmd_ingest,
-        "cluster": cmd_cluster,
         "eval": cmd_eval,
         "block": cmd_block,
     }

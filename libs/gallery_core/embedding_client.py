@@ -98,8 +98,14 @@ class EmbeddingClient:
 
     # ------------------------------------------------------------------ 单张
 
-    async def extract(self, image_bytes: bytes, filename: str = "upload") -> ExtractResult:
-        """提取图片中的全部人脸。
+    async def extract(
+        self, image_bytes: bytes, filename: str = "upload", primary_only: bool = False
+    ) -> ExtractResult:
+        """提取图片中的人脸。
+
+        `primary_only=True` 时只返回最明显的一张脸（面积最大者）。查询自拍用这个：
+        用户要找的是自己，背景里的路人不该参与匹配。筛选在服务端完成，
+        其余人脸根本不会被向量化。
 
         调用方不需要（也不应该）对 image_bytes 做任何预处理 —— resize、EXIF 旋转矫正、
         色彩空间转换全部由服务端负责，以保证离线与在线完全一致。
@@ -108,6 +114,7 @@ class EmbeddingClient:
             resp = await self._client.post(
                 "/extract",
                 files={"image": (filename, image_bytes, "application/octet-stream")},
+                data={"primary_only": str(primary_only).lower()},
             )
         except httpx.HTTPError as exc:
             raise EmbeddingServiceError(f"embedding 服务不可达: {exc}") from exc

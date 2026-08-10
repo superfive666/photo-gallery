@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import csv
-import itertools
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,9 +34,8 @@ log = get_logger(__name__)
 
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 
-# 阈值扫描网格。person 阈值可以比 face 松一些 —— 簇心比单张脸更稳。
-_PERSON_GRID = (0.30, 0.34, 0.38, 0.42, 0.46)
-_FACE_GRID = (0.34, 0.38, 0.42, 0.46, 0.50)
+# 阈值扫描网格。单段式检索只有一个阈值要标定。
+_FACE_GRID = (0.30, 0.34, 0.38, 0.42, 0.46, 0.50, 0.54)
 
 # precision 的下限。串人（把别人的照片给你）的体验远差于漏图，
 # 所以标定时固定守住 precision，再在此前提下最大化 recall。
@@ -105,13 +103,18 @@ def load_cases(eval_dir: Path) -> list[QueryCase]:
 
 
 async def _query_vector(case: QueryCase, embedding: EmbeddingClient) -> list[float] | None:
-    """把一个人的多张自拍合成单一查询向量，与线上行为一致。"""
+    """把一个人的多张自拍合成单一查询向量。
+
+    必须与线上完全一致：每张自拍只取最明显的一张脸（primary_only=True），
+    多张再取均值。差一点点，标定出的阈值就不适用于线上。
+    """
     vectors: list[list[float]] = []
     for selfie in case.selfies:
-        result = await embedding.extract(selfie.read_bytes(), filename=selfie.name)
+        result = await embedding.extract(
+            selfie.read_bytes(), filename=selfie.name, primary_only=True
+        )
         if result.faces:
-            largest = max(result.faces, key=lambda f: f.bbox[2] * f.bbox[3])
-            vectors.append(largest.embedding)
+            vectors.append(result.faces[0].embedding)
     if not vectors:
         return None
     merged: list[float] = mean_embedding(vectors).tolist()
@@ -230,9 +233,9 @@ def _summarize(metrics: list[PersonMetrics], settings: Settings) -> dict[str, ob
         "persons": len(metrics),
         "thresholds": {
             "face": settings.face_match_threshold,
-            "person": settings.person_match_threshold,
             "min_face_px": settings.min_face_px,
             "min_det_score": settings.min_det_score,
+            "search_candidates": settings.search_candidates,
         },
         "recall": round(total_hits / total_truth, 4) if total_truth else 0.0,
         "precision": round(total_hits / total_returned, 4) if total_returned else 0.0,
@@ -252,16 +255,13 @@ async def sweep(
     """在阈值网格上扫描，给出「precision 达标前提下 recall 最大」的建议值。"""
     results: list[dict[str, object]] = []
 
-    for person_th, face_th in itertools.product(_PERSON_GRID, _FACE_GRID):
+    for face_th in _FACE_GRID:
         # 复制一份 settings，避免改到全局单例
-        trial = settings.model_copy(
-            update={"person_match_threshold": person_th, "face_match_threshold": face_th}
-        )
+        trial = settings.model_copy(update={"face_match_threshold": face_th})
         # 扫描阶段不做归因（每个格点都查一遍库太慢），只要 precision/recall
         _, summary = await evaluate(session, embedding, trial, eval_dir, attribute=False)
         results.append(
             {
-                "person_threshold": person_th,
                 "face_threshold": face_th,
                 "recall": summary["recall"],
                 "precision": summary["precision"],
@@ -269,7 +269,6 @@ async def sweep(
         )
         log.info(
             "sweep_point",
-            person=person_th,
             face=face_th,
             recall=summary["recall"],
             precision=summary["precision"],

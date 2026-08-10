@@ -35,8 +35,8 @@
 ## 三条主链路
 
 ```
-① 离线建库   jobs → photos.zrc.sg → 批量人脸检测/embedding → Postgres(pgvector) → 聚类成 person
-② 在线检索   web → api → embedding(自拍) → pgvector KNN → 聚合到 person → 照片 URL + 缩略图
+① 离线建库   jobs → photos.zrc.sg → 批量人脸检测/embedding → Postgres(pgvector)
+② 在线检索   web → api → embedding(自拍取最明显一张脸) → KNN → 照片 URL + 缩略图
 ③ 前端界面   上传/拍摄自拍（可选限定相册）→ 结果网格 → lightbox / 跳回原站原图
 ```
 
@@ -44,11 +44,14 @@
 
 | 表 | 一行是什么 | 关键字段 |
 | --- | --- | --- |
-| `photo` | 一张照片/视频 | `id`(uuidv7) `album` `photo_url` `thumbnail` |
-| `face` | **一张脸** | `id`(uuidv7) `photo_id` `album` `embedding(512)` |
+| `photo` | 一张照片/视频 | `id`(uuidv7) · `album` · `photo_url` · `thumbnail` |
+| `face` | **一张脸** | `id`(uuidv7) · `photo_id`(FK) · `embedding(512)` |
 
 一张合影有多个人 → 一条 photo 对应多条 face，这是分表的原因。
-`face` 按 `album` 做 LIST 分区，使「只在某次活动里找」能被裁剪成单分区精确检索。
+`album` 只在 `photo` 上，`face` 通过外键间接得到。
+
+**不存 person、不做聚类、不给人脸命名。** 查询完全是实时的：上传自拍 → 取最明显的
+一张脸 → 对 face 做 KNN → 返回照片。自拍处理完即销毁。
 
 详见 [`docs/architecture.md`](docs/architecture.md)。
 
@@ -62,7 +65,6 @@ make up                            # 起 postgres + embedding + api + web
 make migrate                       # 执行 docs/schema 下的 DDL
 make probe  ALBUM=2026-08-10       # 先探查源站页面结构，确认解析正确
 make ingest ALBUM=2026-08-10       # 批量拉取 + embedding + 落库
-make cluster                       # 人脸聚类成 person
 open http://localhost:8080
 ```
 
@@ -78,7 +80,11 @@ open http://localhost:8080
 
 - **小脸召回不了。** 短边小于 `MIN_FACE_PX`（默认 40px）的人脸 embedding 不可靠，会被丢弃。
   大合影里站在后排的人很可能搜不到。
-- **侧脸、遮挡、口罩、墨镜** 会显著降低召回率。person 聚类能部分缓解（侧脸可经由同簇的正脸被间接命中）。
+- **侧脸、遮挡、口罩、墨镜会显著降低召回率。** 因为不做 person 聚类，侧脸没有「经由
+  同一个人的正脸被间接命中」这条路径，这类照片就是搜不到。这是「不存人物身份数据」
+  换来的代价，不是 bug。缓解办法只有一个：多上传一两张不同角度的自拍。
+- **某人照片特别多时结果会被截断。** 检索取 `SEARCH_CANDIDATES`（默认 500）个最近邻
+  候选再过滤，超出的部分不会返回。遇到这种情况调这个值，不要调阈值。
 - **儿童照片、跨越多年的照片**准确率下降明显 —— 人脸随年龄变化，ArcFace 对此不鲁棒。
 - **误报无法归零。** 阈值是 precision/recall 的权衡，调高会漏、调低会串人。阈值标定方法见
   [`docs/evaluation.md`](docs/evaluation.md)。
@@ -98,7 +104,8 @@ open http://localhost:8080
   把他在所有活动里的照片一次性聚齐 —— 可及性的量变就是隐私上的质变。
   所以本站需要邀请码。
 - 本项目只存 256px 缩略图，原图始终只是一个指向源站的 URL，不复制、不缓存。
-- 提供 opt-out：可按 person 或按照片将内容从检索结果中永久屏蔽。
+- 检索结束后界面会**明确告知自拍已删除** —— 不只是上传前承诺一句，而是完成后确认一次。
+- 提供 opt-out：`make block SELFIE=...` 用当事人的自拍把他的全部人脸从检索中永久屏蔽。
 
 ---
 

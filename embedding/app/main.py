@@ -8,7 +8,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from embedding.app.model import ExtractOutcome, FaceExtractor
@@ -146,7 +146,12 @@ async def _read_upload(upload: UploadFile) -> bytes:
 
 
 @app.post("/extract", response_model=ExtractOut)
-async def extract(image: UploadFile = File(...)) -> ExtractOut:  # noqa: B008
+async def extract(
+    image: UploadFile = File(...),  # noqa: B008
+    # 只保留最明显的一张脸。查询自拍走这个：用户要找的是自己，
+    # 背景里的路人不该参与匹配，也不该被向量化。
+    primary_only: bool = Form(default=False),
+) -> ExtractOut:
     """单张。在线检索走这个 —— 延迟优先。"""
     if not _extractor.loaded:
         raise HTTPException(status_code=503, detail="模型尚未加载完成")
@@ -157,7 +162,7 @@ async def extract(image: UploadFile = File(...)) -> ExtractOut:  # noqa: B008
     async with _inference_slots:
         # to_thread 是关键：推理是同步阻塞的，直接在 event loop 里跑
         # 会让整个服务在并发下卡死。
-        outcome = await asyncio.to_thread(_extractor.extract, payload)
+        outcome = await asyncio.to_thread(_extractor.extract, payload, primary_only)
     latency_ms = int((time.perf_counter() - started) * 1000)
 
     if outcome.error is not None:
@@ -168,6 +173,7 @@ async def extract(image: UploadFile = File(...)) -> ExtractOut:  # noqa: B008
         "extract_done",
         faces=len(outcome.faces),
         discarded=outcome.discarded,
+        primary_only=primary_only,
         latency_ms=latency_ms,
     )
 

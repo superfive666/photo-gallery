@@ -20,8 +20,8 @@
      ▼                                                              ▼
    ┌────────────────────────────────────────────────────────────────┐
    │              Postgres 16 + pgvector (HNSW, cosine)             │
-   │   photo (album 索引)   face (按 album LIST 分区)   person       │
-   │   block_list  album_sync_state  job_run  search_audit          │
+   │   photo (id/album/photo_url/thumbnail)  ──1:N──▶  face          │
+   │   block_list   album_sync_state   job_run   search_audit       │
    └────────────────────────────────────────────────────────────────┘
                                                                   ▲
                                                        ④ /api/*   │
@@ -39,7 +39,7 @@
 
 | 接口 | 用途 | 优化目标 |
 | --- | --- | --- |
-| `POST /extract` | 在线检索的单张自拍 | 延迟 |
+| `POST /extract` | 在线检索的单张自拍（`primary_only` 只取最明显的一张脸） | 延迟 |
 | `POST /extract/batch` | 离线建库的一批照片 | 吞吐 / GPU 利用率 |
 | `GET /healthz` | 模型状态、GPU 开关、批量能力、批量上限 | — |
 
@@ -79,7 +79,8 @@
 ### `api` — 业务服务
 
 - 邀请码换取签名 session cookie（HttpOnly / Secure / SameSite=Lax），JWT，短有效期。
-- `POST /api/search` — multipart 上传 1~3 张自拍 + 可选 `album`，同步返回匹配结果。
+- `POST /api/search` — multipart 上传 1~3 张自拍 + 可选 `album`，同步返回匹配结果，
+  响应里带 `selfie_discarded: true` 供前端向用户确认。
 - `GET /api/albums` — 有可检索人脸的相册列表，供前端筛选器使用。
 - `GET /api/photos/{id}/thumb` — 输出缩略图，带 ETag 与长缓存。
 - `GET /api/photos/{id}/original` — 302 到源站原图。
@@ -93,9 +94,8 @@
 python -m jobs migrate                          # 执行未应用的迁移
 python -m jobs probe  --album 2026-08-10        # 探查源站页面结构，不写库
 python -m jobs ingest --album 2026-08-10        # 批量拉取 + 提取 + 落库
-python -m jobs cluster                          # 人脸聚类成 person
 python -m jobs eval   --sweep                   # 阈值标定
-python -m jobs block  --person <uuid>           # opt-out
+python -m jobs block  --selfie me.jpg           # opt-out：屏蔽此人的全部人脸
 ```
 
 ### `web` — 前端
@@ -104,37 +104,47 @@ Vite 构建为纯静态产物，nginx 托管并反代 `/api` 到 `api` 容器。
 
 ## 3. 检索算法
 
-朴素做法是「自拍向量 vs 每一条 face 向量取 top-k」。本项目不这么做，因为一个人的侧脸/背光
-照片和其正脸自拍的 cosine 距离往往超过阈值，会漏掉大量本该命中的照片。
-
-改为**两段式：先认人，再取图**。
+单段式，全部实时完成：
 
 ```
-① 离线：对全库 face embedding 做 DBSCAN 聚类 → person 簇
-        每个簇记录 centroid（成员向量均值再归一化）与成员数
-
-② 在线：
-   a. 自拍 → embedding（多张自拍则取均值后重新归一化，等价于更稳的查询点）
-   b. 对 person.centroid 做 KNN，取相似度 ≥ PERSON_MATCH_THRESHOLD 的候选簇
-   c. 对 face.embedding 做 KNN，取相似度 ≥ FACE_MATCH_THRESHOLD 的直接命中脸
-   d. 合并：候选簇内的全部 face → 其所属 photo；并上 (c) 的直接命中
-   e. 每张 photo 的得分 = 该照片上所有命中脸的最高相似度
-   f. 按得分降序返回，附 album 与缩略图 URL
+① 上传 1~3 张自拍
+② 每张只取**最明显的一张脸**（面积最大者），筛选在 embedding 服务端完成
+③ 多张则取均值后重新归一化 → 单一查询向量
+④ 对 face.embedding 做 KNN 取候选（走 HNSW 索引），按阈值过滤
+⑤ 命中的人脸映射回照片，每张照片取其上所有命中人脸的最高相似度作为得分
+⑥ 按得分降序返回，附 album 与缩略图 URL
+⑦ 自拍字节在请求返回时失去引用，响应里显式告知用户「已删除」
 ```
 
-`(c)` 这一路是给聚类失败的人脸（噪声点、只出现过一次的人）留的兜底，不能省。
+**为什么每张自拍只取一张脸**：用户要找的是自己。背景里的路人如果也被向量化并参与
+匹配，会把别人的照片混进结果里。筛选放在 embedding 服务内、识别前向**之前** ——
+其余人脸根本不会被向量化，既省算力，也让离开该服务的人脸数据最少化。
 
-**为什么簇心投票有效**：簇内包含同一人的正脸、侧脸、不同光照的多个样本，簇心比任何单张
-照片都更接近这个人的「平均长相」，因此对查询自拍的角度差异更鲁棒。
+「最明显」的判据是人脸框面积，`det_score` 作为并列时的次序。刻意不引入更复杂的打分
+（清晰度、居中程度）：这个选择直接决定查询结果，规则越简单越容易在出问题时说清原因。
 
-### album 过滤与分区
+**多张自拍取均值**是目前唯一的召回率提升手段（库里不做聚类），多角度的均值是一个更
+中性、对侧脸更宽容的查询点。所以 UI 会主动鼓励用户多传一张，但绝不强制。
 
-`face` 按 `album` 做 LIST 分区，所以带 `album =` 条件的检索会被裁剪到单个分区 ——
-只在那一个相册里做向量检索，又快又精确。这是前端相册筛选器的实现基础。
+### 不做 person 聚类的代价
 
-不带 album 的全库检索（主流程）无法裁剪，需要对每个分区各做一次 HNSW 索引扫描再
-MergeAppend。在本项目量级下是几十毫秒的代价，但随相册数量线性增长。
-**权衡与退出路径见 [`schema/README.md`](schema/README.md#分区的代价)。**
+一个人的侧脸/背光照片与其正脸自拍的 cosine 距离常常超过阈值。先聚类再按人取图能让
+侧脸经由同簇的正脸被间接命中；单段式没有这条路径，**这类照片的召回率会更低**。
+
+这是有意的取舍：不落任何长期的人物身份数据，查询完全实时。已写进 README 的已知局限，
+不要当成 bug 排查。
+
+### 候选数是召回上限
+
+pgvector 的 HNSW 只在 `ORDER BY ... LIMIT n` 形式下会被用到，所以检索先取 N 个最近邻
+候选、再按阈值过滤。`SEARCH_CANDIDATES`（默认 500）因此是硬上限：某人照片数超过它就会
+被截断。带相册过滤时代码会自动放大 4 倍（过滤发生在取候选之后）。
+细节见 [`schema/README.md`](schema/README.md#向量检索的写法)。
+
+### album 过滤
+
+`photo.album` 上有索引，检索 SQL 里带 `ph.album = :album` 即可。这是普通过滤，
+不是分区裁剪 —— 好处是全库检索（主流程）不受任何分区归并开销影响。
 
 ### 质量门控
 
@@ -155,9 +165,9 @@ MergeAppend。在本项目量级下是几十毫秒的代价，但随相册数量
 **`photo` 与 `face` 必须分表。** 一张十人合影产生 1 条 photo + 10 条 face。
 把 embedding 挂在 photo 上是从一开始就走不通的。
 
-**`album` 是一个 slug 字符串，不是外键。** 源站的 album 本身就是 URL 里那一段
-（`/album/2026-08-10`），没有额外元数据，所以不需要 album 表。`face` 上冗余存一份 ——
-这是分区的前提，分区键必须在本表上。
+**`album` 是一个 slug 字符串，不是外键，只放在 `photo` 上。** 源站的 album 本身就是
+URL 里那一段（`/album/2026-08-10`），没有额外元数据，所以不需要 album 表。
+`face` 通过 `photo_id` 外键间接得到 album，不冗余存第二份。
 
 **主键用 UUIDv7 而非 v4。** v4 完全随机，批量入库时 B-tree 页分裂严重；v7 前 48 位是
 毫秒时间戳，插入始终落在索引右端。
@@ -169,9 +179,10 @@ JSON 里。存二进制 + 由 `/api/photos/{id}/thumb` 单独分发的好处：P
 
 **向量索引用 HNSW，不用 IVFFlat。** HNSW 无需预训练、召回率更高、增量插入友好。
 
-**规模估算：** 5 万张照片 × 平均 3 张脸 ≈ 15 万条 512 维向量 ≈ 300MB 原始向量。
-这个量级 pgvector HNSW 单次 KNN 在毫秒级。不需要引入独立向量数据库 ——
-说实话也不需要分区，分区是为了 album 级检索的精确性。
+**`face` 是普通表，不分区。** 5 万张照片 × 平均 3 张脸 ≈ 15 万条 512 维向量。
+这个量级 pgvector HNSW 单次 KNN 在毫秒级；按 album 分区只会让全库检索（主流程）
+变成对 N 个分区各扫一次再归并。取舍过程见
+[`plans/0003`](plans/0003-drop-partition-and-person.md)。
 
 ## 5. 幂等与增量
 
@@ -181,7 +192,7 @@ JSON 里。存二进制 + 由 `/api/photos/{id}/thumb` 单独分发的好处：P
   静态站点的 URL 稳定且天然唯一，不需要再造一个 source_asset_id。
 - 增量策略：**该 URL 成功入库过（`processing_status = 'embedded'`）就跳过**。
   对追加式照片墙够用；同一 URL 内容被替换的情况检测不到，需要时用 `--full`。
-- 写新人脸前先按 `(album, photo_id)` 删旧人脸 —— 保证重跑不累积重复向量。
+- 写新人脸前先按 `photo_id` 删旧人脸 —— 保证重跑不累积重复向量。
 - `photo.processing_status` ∈ `pending|embedded|failed|skipped`，`processing_error`
   存错误摘要。单张失败不阻塞整批，下次运行自动重试，job 结束时汇总报告。
 - 静态相册页一次给出完整清单，所以「没见到」即「源站已删除」→ 标记 `deleted_at`
@@ -216,10 +227,14 @@ JSON 里。存二进制 + 由 `/api/photos/{id}/thumb` 单独分发的好处：P
 
 - **邀请码。** 人脸检索创造了一个源站本身没有的能力 —— 拿一张某人的照片就能把他在所有
   活动里的照片一次性聚齐。见 [`privacy.md`](privacy.md)。
+- **查询自拍零留存，并且让用户看见。** 字节只在请求生命周期内存在，响应里的
+  `selfie_discarded` 让这个承诺在界面上可验证，而不只是文档里的一句话。
 - **上传接口防护**：文件大小上限、真实 MIME 嗅探（不信 `Content-Type`）、
   Pillow 的 decompression bomb 防护、按 session + IP 双维度限流。
 - **EXIF 剥离**：自拍的 EXIF（含 GPS）在进入推理前就丢弃，且本来也不会被持久化。
-- **屏蔽名单**：`block_list` 支持按 person 或 photo 屏蔽，在 SQL 层过滤。
+- **屏蔽名单**：`block_list` 支持按 face 或 photo 屏蔽，在 SQL 层过滤。
+  没有 person 表，所以「屏蔽某个人」= 屏蔽他的那一批 face，用
+  `jobs block --selfie <路径>` 一条命令完成。
 
 ## 8. 可观测性
 
@@ -229,4 +244,6 @@ JSON 里。存二进制 + 由 `/api/photos/{id}/thumb` 单独分发的好处：P
   措施不是许可）。
 - `job_run` 表记录每次离线任务：处理数、跳过数、失败数、丢弃的小脸数、批次数、
   下载字节数、耗时。这张表是排查「召回率变差」的第一现场。
+- `search_audit` 的 `candidate_count` 记录本次取了多少候选 —— 结果数逼近它时，
+  说明是候选数在截断召回，该调 `SEARCH_CANDIDATES` 而不是阈值。
 - `/healthz` 上的 `batch_supported` 与 `gpu` 用于确认批量推理真的生效了。

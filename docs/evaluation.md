@@ -58,6 +58,9 @@ person_02,2026-08-10/IMG_0231.jpg
 | MRR | 首个正确结果的排名倒数 | 衡量排序质量 |
 | 漏检归因 | 漏掉的照片中，因小脸被丢弃 / 检测失败 / 相似度不足 各占多少 | **最有价值的诊断** |
 
+另外要盯一眼报告里的 `candidate_count`：如果结果数逼近 `SEARCH_CANDIDATES`，
+说明召回是被候选数截断的，此时无论怎么调阈值都不会变好。
+
 **漏检归因**是最该看的一项：如果漏检主要来自「小脸被质量门控丢弃」，那调阈值是白费力气，
 该做的是降低 `MIN_FACE_PX` 或对大图做分块检测；如果主要来自「相似度不足」，才轮到调阈值。
 
@@ -69,7 +72,6 @@ person_02,2026-08-10/IMG_0231.jpg
 # 1. 把评估集的 gallery 灌进库（指向一个独立的测试数据库，别污染生产库）
 #    local_dir adapter 会把 gallery/ 下的一级子目录名当作 album slug
 SOURCE_ADAPTER=local_dir SOURCE_LOCAL_DIR=/data/eval/gallery make ingest
-make cluster
 
 # 2. 评估
 make eval                # 全量评估 + 漏检归因
@@ -79,14 +81,15 @@ make eval SWEEP=1        # 阈值网格扫描，给出建议阈值
 `jobs/eval.py` 做的事：
 
 1. 从 `labels.csv` 读 ground truth，从 `queries/<person>/` 读自拍。
-2. 每个人的多张自拍合成单一查询向量（与线上完全一致的做法）。
+2. 每张自拍取最明显的一张脸（`primary_only=True`），多张再取均值 ——
+   必须与线上**完全一致**，差一点点标定出的阈值就不适用。
 3. 调用 **api 里那份真实的 `search_by_embedding`** 执行检索 ——
    不是另写一份近似实现，否则测出来的指标和线上行为无关。
 4. 计算 recall / precision / recall@20 / MRR。
 5. 对每一张漏掉的照片做归因（`small_face` / `detect_fail` / `low_similarity` /
    `not_ingested`）。
-6. `--sweep` 时在 `PERSON_MATCH_THRESHOLD × FACE_MATCH_THRESHOLD` 网格上扫描，
-   输出 precision ≥ 0.95 前提下 recall 最大的组合。
+6. `--sweep` 时在 `FACE_MATCH_THRESHOLD` 上扫描，输出 precision ≥ 0.95 前提下
+   recall 最大的取值。单段式检索只有这一个阈值要标定。
 
 > `labels.csv` 里的 `gallery_path` 是相对 `gallery/` 的路径（形如
 > `2026-08-10/IMG_0001.jpg`），评估用 `local_dir.photo_url_for()` 把它换算成库里的
@@ -97,12 +100,10 @@ make eval SWEEP=1        # 阈值网格扫描，给出建议阈值
 ## 当前默认值（未标定，仅为占位）
 
 ```
-FACE_MATCH_THRESHOLD    = 0.42    # 单脸直接命中
-PERSON_MATCH_THRESHOLD  = 0.38    # 簇心匹配，可略松（簇心更稳）
+FACE_MATCH_THRESHOLD    = 0.42    # 唯一需要标定的相似度阈值
 MIN_DET_SCORE           = 0.50
 MIN_FACE_PX             = 40
-CLUSTER_MIN_SAMPLES     = 3       # DBSCAN
-CLUSTER_EPS             = 0.30
+SEARCH_CANDIDATES       = 500     # 召回上限，不是阈值
 ```
 
 > ⚠️ 这些是文献经验值，**不是**本项目的标定结果。首次评估完成后必须回来更新本节，
@@ -113,5 +114,5 @@ CLUSTER_EPS             = 0.30
 阈值和模型是「改一下好像更好了」最容易失控的地方。所以：
 
 - 评估结果（指标 + 阈值 + 模型版本 + 日期）追加到 `docs/evaluation-history.md`，只增不改。
-- 任何改动模型、预处理、阈值、聚类参数的 PR，都要贴上评估前后对比。
+- 任何改动模型、预处理、阈值、候选数的 PR，都要贴上评估前后对比。
 - CI 不跑评估（需要真人照片，不能进 runner），由人工在本地执行并把结果贴到 PR。

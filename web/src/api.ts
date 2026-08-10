@@ -19,10 +19,13 @@ export type SearchStatus = 'ok' | 'no_face' | 'no_match'
 
 export interface SearchResponse {
   matches: Match[]
-  faces_detected: number
+  // 从几张自拍里取到了可用的人脸（每张最多取一张 —— 最明显的那张）
+  faces_used: number
   status: SearchStatus
   message: string | null
   latency_ms: number
+  // 服务端确认自拍已销毁。恒为 true，但要显式展示给用户而不是让他猜。
+  selfie_discarded: boolean
 }
 
 export class ApiError extends Error {

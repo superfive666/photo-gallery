@@ -10,6 +10,7 @@ import {
   type SearchResponse,
 } from './api'
 import { AlbumFilter } from './components/AlbumFilter'
+import { DiscardNotice } from './components/DiscardNotice'
 import { EmptyState } from './components/EmptyState'
 import { InviteGate } from './components/InviteGate'
 import { Lightbox } from './components/Lightbox'
@@ -131,6 +132,9 @@ export function App() {
               重新开始
             </button>
           </div>
+
+          {/* 检索一结束就确认自拍已销毁，不管有没有结果 */}
+          <DiscardNotice confirmed={result.selfie_discarded} />
 
           {matches.length > 0 ? (
             <ResultGrid matches={matches} onOpen={setLightboxIndex} />

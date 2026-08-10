@@ -63,9 +63,10 @@ ingest: ## 拉取并建库（批量）。用法：make ingest ALBUM=2026-08-10�
 ingest-full: ## 全量重跑（忽略已入库记录）
 	$(COMPOSE) run --rm jobs python -m jobs ingest --full $(if $(ALBUM),--album $(ALBUM),)
 
-.PHONY: cluster
-cluster: ## 重跑 person 聚类
-	$(COMPOSE) run --rm jobs python -m jobs cluster
+.PHONY: block
+block: ## opt-out：屏蔽某人全部人脸。用法：make block SELFIE=/data/eval/me.jpg
+	@test -n "$(SELFIE)" || { echo "用法：make block SELFIE=<自拍路径>"; exit 2; }
+	$(COMPOSE) run --rm jobs python -m jobs block --selfie "$(SELFIE)"
 
 .PHONY: eval
 eval: ## 跑评估集，输出 precision/recall 与漏检归因

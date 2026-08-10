@@ -32,11 +32,11 @@
 5. **每条 face 记录必须带 `model_name` / `model_version` / `dim`。**
    换模型时靠这几个字段识别存量数据并重算，而不是整库作废。
 6. **DDL 只以追加方式演进。** 新增 `docs/schema/NNN_*.sql`，绝不原地修改已发布的迁移文件。
-7. **所有针对 `face` 表的查询/DML 都必须带上 `album` 条件**（除了故意的全库检索）。
-   `face` 按 `album` 做 LIST 分区，少了这个条件就会扫描全部分区 —— 不会报错，只是慢，
-   所以极容易在 review 时被放过。见 `docs/schema/README.md`。
-8. **先建分区、再插数据。** 某个 album 的行一旦落进 `face_default`，之后就无法再为它
-   建专属分区（Postgres 会拒绝）。`pipeline` 的顺序不能颠倒。
+7. **向量检索必须保持「内层 ORDER BY + LIMIT 取候选、外层过滤」的两层结构。**
+   pgvector 的 HNSW 只在这个形式下会被用到；把阈值直接写进 WHERE 会退化成全表扫描 ——
+   不报错，只是慢。见 `docs/schema/README.md`「向量检索的写法」。
+8. **不存任何长期的人物身份数据。** 没有 person 表、不做聚类、不给人脸命名。
+   查询是实时的，用完即弃。
 9. **self-hosted runner 上不得因 fork PR 而执行不受信任的代码。** 见 `docs/cicd.md`。
 
 ## 常用命令
@@ -47,7 +47,6 @@ make up / down     # 起停 compose
 make migrate       # 顺序执行 docs/schema/*.sql
 make probe ALBUM=x  # 探查源站页面结构，不写库
 make ingest ALBUM=x # 批量离线建库
-make cluster       # 重跑 person 聚类
 make test          # api + jobs 的 pytest，web 的 vitest
 make lint          # ruff + mypy + eslint + prettier
 make eval          # 跑阈值评估集，输出 precision/recall
@@ -71,13 +70,15 @@ make eval          # 跑阈值评估集，输出 precision/recall
 
 ## 数据模型速览
 
-两张主表。一张合影有多个人 → 一条 photo 对应多条 face，这是分表的原因。
+只有两张主表。一张合影有多个人 → 一条 photo 对应多条 face，这是分表的原因。
 
 - `photo` — `id`(uuidv7) / `album` / `photo_url`(唯一，幂等键) / `thumbnail`(BYTEA)
-- `face` — `id`(uuidv7) / `photo_id` / `album` / `embedding(512)`，**按 album LIST 分区**，
-  PK 是 `(album, id)`
+- `face` — `id`(uuidv7) / `photo_id`(FK) / `embedding(512)`，普通表不分区
 
+`album` 只在 `photo` 上 —— 照片属于哪个相册是它自己的属性，`face` 通过外键间接得到。
 `album` 就是源站 URL 里那段 slug（`/album/2026-08-10`），不是外键，没有 album 表。
+
+没有 `person` 表、不做聚类。查询完全实时：自拍 → 最明显的一张脸 → KNN。
 
 ## 当前未决问题
 
@@ -87,4 +88,4 @@ make eval          # 跑阈值评估集，输出 precision/recall
   **下一步跑 `make probe ALBUM=2026-08-10`**，拿到真实输出后收敛成精确选择器。
   详见 [`docs/data-source.md`](docs/data-source.md)。
 - 相似度阈值需要用真实数据标定，当前默认值只是文献经验值。见 `docs/evaluation.md`。
-- 分区方案的取舍已记录在 `docs/schema/README.md`「分区的代价」—— 相册数到千级时要重新评估。
+- `SEARCH_CANDIDATES`（默认 500）是召回上限，尚未用真实数据验证是否够用。

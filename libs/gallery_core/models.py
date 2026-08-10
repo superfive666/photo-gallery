@@ -27,10 +27,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 EMBEDDING_DIM = 512
 ALBUM_MAX_LEN = 200
-
-# album 是 face 表的分区键。显式 COLLATE "C" 让分区路由与 locale 无关、可预测，
-# 并保证 photo.album 与 face.album 用同一排序规则（否则 JOIN 时会报无法确定 collation）。
-ALBUM_TYPE = String(ALBUM_MAX_LEN, collation="C")
+ALBUM_TYPE = String(ALBUM_MAX_LEN)
 
 # 列默认值走数据库函数，而不是 Python 侧 default：
 # 批量 COPY / executemany 时也能拿到 uuidv7，行为与手写 SQL 一致。
@@ -48,8 +45,10 @@ def _uuid7_pk() -> Mapped[uuid.UUID]:
 class Photo(Base):
     """源站的一张照片或一个视频。
 
-    photo_url 就是幂等写入的唯一键 —— 源站是公开静态相册，URL 稳定且天然唯一，
-    不需要再额外造一个 source_asset_id。
+    photo_url 就是幂等写入的唯一键 —— 源站是公开静态相册，URL 稳定且天然唯一。
+
+    album 只属于 photo：一张照片属于哪个相册是它自己的属性，与它上面有几张脸无关。
+    face 通过 photo_id 外键间接得到 album。
     """
 
     __tablename__ = "photo"
@@ -86,40 +85,15 @@ class Photo(Base):
     faces: Mapped[list[Face]] = relationship(back_populates="photo")
 
 
-class Person(Base):
-    """人脸聚类得到的簇。不分区（跨相册），不承载真实身份。"""
-
-    __tablename__ = "person"
-
-    id: Mapped[uuid.UUID] = _uuid7_pk()
-    label: Mapped[str | None] = mapped_column(Text)
-    # 簇内成员向量均值再 L2 归一化。两段式检索的第一段就是对它做 KNN。
-    centroid: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM))
-    face_count: Mapped[int] = mapped_column(Integer, default=0)
-    model_name: Mapped[str] = mapped_column(Text)
-    model_version: Mapped[str] = mapped_column(Text)
-    created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-    updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-
-
 class Face(Base):
     """向量主表。一张脸一行；十人合影 = 1 条 Photo + 10 条 Face。
 
-    按 album 做 LIST 分区。分区表的主键必须包含分区键，所以 PK 是 (album, id)。
+    普通表，不分区 —— 十万级向量单个 HNSW 索引的 KNN 就是毫秒级。
     """
 
     __tablename__ = "face"
 
-    # 复合主键：album 在前，让 PK 索引同时服务按相册的前缀查找
-    album: Mapped[str] = mapped_column(ALBUM_TYPE, primary_key=True)
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, server_default=_UUID7_DEFAULT
-    )
-
+    id: Mapped[uuid.UUID] = _uuid7_pk()
     photo_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("photo.id", ondelete="CASCADE"))
 
     # 已 L2 归一化。归一化只在 embedding 服务出口做一次。
@@ -133,10 +107,6 @@ class Face(Base):
     face_px: Mapped[int] = mapped_column(Integer)
     det_score: Mapped[float] = mapped_column(REAL)
 
-    person_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("person.id", ondelete="SET NULL")
-    )
-
     model_name: Mapped[str] = mapped_column(Text)
     model_version: Mapped[str] = mapped_column(Text)
     dim: Mapped[int] = mapped_column(Integer, default=EMBEDDING_DIM)
@@ -149,13 +119,17 @@ class Face(Base):
 
 
 class BlockList(Base):
-    """opt-out。检索必须在 SQL 层过滤，不要在应用层结果集里过滤。"""
+    """opt-out。检索必须在 SQL 层过滤，不要在应用层结果集里过滤。
+
+    没有 person 表，所以「屏蔽某个人」= 屏蔽他的那一批 face。
+    用 `jobs block --selfie <路径>` 一条命令完成。
+    """
 
     __tablename__ = "block_list"
 
     id: Mapped[uuid.UUID] = _uuid7_pk()
-    scope: Mapped[str] = mapped_column(Text)  # 'person' | 'photo'
-    person_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("person.id", ondelete="CASCADE"))
+    scope: Mapped[str] = mapped_column(Text)  # 'face' | 'photo'
+    face_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("face.id", ondelete="CASCADE"))
     photo_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("photo.id", ondelete="CASCADE"))
     reason: Mapped[str | None] = mapped_column(Text)
     created_by: Mapped[str | None] = mapped_column(Text)
@@ -182,7 +156,7 @@ class JobRun(Base):
     __tablename__ = "job_run"
 
     id: Mapped[uuid.UUID] = _uuid7_pk()
-    kind: Mapped[str] = mapped_column(Text)  # ingest | cluster | recompute
+    kind: Mapped[str] = mapped_column(Text)  # ingest | recompute
     album: Mapped[str | None] = mapped_column(ALBUM_TYPE)
     status: Mapped[str] = mapped_column(Text, default="running")
     started_at: Mapped[dt.datetime] = mapped_column(

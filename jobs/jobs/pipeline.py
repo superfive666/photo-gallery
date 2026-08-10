@@ -6,9 +6,7 @@
     这是 GPU 利用率的主要来源。批大小同时受「张数」和「字节数」两个上限约束 ——
     只限张数的话，遇到一批高像素原图会直接把内存顶穿。
   · **幂等**：任意时刻被杀掉再重跑，不产生重复、不丢数据。靠 photo_url 唯一约束
-    + ON CONFLICT DO UPDATE，以及写新人脸前先按 (album, photo_id) 删旧人脸。
-  · **先建分区、再插数据**：face 按 album 做 LIST 分区。如果某个 album 的行先落进了
-    DEFAULT 分区，之后再为它建专属分区会被 Postgres 拒绝。顺序不能颠倒。
+    + ON CONFLICT DO UPDATE，以及写新人脸前先按 photo_id 删旧人脸。
   · **单张失败不中断整批**：错误记进 photo.processing_error，最后汇总。
   · **原图不落盘**：批次的字节只存在于内存中，处理完即释放。不做原图缓存。
 """
@@ -127,18 +125,6 @@ async def ingest(
     return stats
 
 
-async def ensure_partition(session: AsyncSession, album: str) -> str:
-    """为 album 建 face 分区。必须在插入该 album 的任何 face 之前调用。
-
-    幂等且并发安全（SQL 函数内部吞掉 duplicate_table）。
-    """
-    name = (
-        await session.execute(text("SELECT ensure_face_partition(:album)"), {"album": album})
-    ).scalar_one()
-    await session.commit()
-    return str(name)
-
-
 async def _ingest_album(
     session: AsyncSession,
     adapter: SourceAdapter,
@@ -151,9 +137,6 @@ async def _ingest_album(
     full: bool,
 ) -> None:
     started_at = dt.datetime.now(tz=dt.UTC)
-
-    partition = await ensure_partition(session, album)
-    log.info("partition_ready", album=album, partition=partition)
 
     # 静态相册页一次就给出全部条目，所以我们总是掌握完整清单，
     # 「没见到」即等于「源站已删除」。
@@ -283,7 +266,7 @@ async def _process_batch(
         return
 
     url_to_id = await _upsert_photos(session, photo_rows)
-    await _replace_faces(session, album, url_to_id, face_specs, settings, stats)
+    await _replace_faces(session, url_to_id, face_specs, stats)
     await session.commit()
 
 
@@ -356,10 +339,8 @@ async def _upsert_photos(session: AsyncSession, rows: list[dict[str, Any]]) -> d
 
 async def _replace_faces(
     session: AsyncSession,
-    album: str,
     url_to_id: dict[str, uuid.UUID],
     specs: list[tuple[str, ExtractResult]],
-    settings: Settings,
     stats: IngestStats,
 ) -> None:
     photo_ids = [url_to_id[url] for url, _ in specs if url in url_to_id]
@@ -367,11 +348,9 @@ async def _replace_faces(
         return
 
     # 重跑时先清掉这些照片的旧人脸再写新的 —— 保证幂等，不累积重复向量。
-    # 条件里带上 album：face 按 album 分区，给了分区键才能裁剪到单个分区，
-    # 否则会扫描全部分区。
     await session.execute(
-        text("DELETE FROM face WHERE album = :album AND photo_id = ANY(CAST(:ids AS uuid[]))"),
-        {"album": album, "ids": [str(pid) for pid in photo_ids]},
+        text("DELETE FROM face WHERE photo_id = ANY(CAST(:ids AS uuid[]))"),
+        {"ids": [str(pid) for pid in photo_ids]},
     )
 
     face_rows: list[dict[str, Any]] = []
@@ -382,7 +361,6 @@ async def _replace_faces(
         for f in result.faces:
             face_rows.append(
                 {
-                    "album": album,
                     "photo_id": photo_id,
                     "embedding": f.embedding,
                     "bbox_x": f.bbox[0],
@@ -404,7 +382,6 @@ async def _replace_faces(
         stats.faces_added += len(face_rows)
 
     stats.processed += len(photo_ids)
-    _ = settings  # 保留签名对称性，阈值相关参数目前不在这一步使用
 
 
 async def _already_embedded(session: AsyncSession, album: str, urls: list[str]) -> set[str]:

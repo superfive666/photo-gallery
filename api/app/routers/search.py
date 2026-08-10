@@ -2,6 +2,9 @@
 
 ⚠️ 这里处理的是用户人脸。上传的字节只存在于本请求的内存中，函数返回即失去引用。
 不写盘、不写库、不写日志。见 CLAUDE.md 约束 #1。
+
+响应里会明确告知用户自拍已销毁（`selfie_discarded`）—— 这不是装饰性字段，
+是让隐私承诺在界面上可见的唯一手段。
 """
 
 from __future__ import annotations
@@ -35,11 +38,15 @@ class MatchOut(BaseModel):
 
 class SearchOut(BaseModel):
     matches: list[MatchOut]
-    faces_detected: int
+    # 一共从几张自拍里取到了可用的人脸（每张最多取一张 —— 最明显的那张）
+    faces_used: int
     # 前端据此展示对应的空状态：没检测到脸 vs 检测到了但没匹配上
     status: str  # ok | no_face | no_match
     message: str | None = None
     latency_ms: int
+    # 恒为 true。自拍从不落盘落库，请求结束即从内存中消失 ——
+    # 前端要把这一点显式告诉用户，而不是让他猜。
+    selfie_discarded: bool = True
 
 
 @router.post("", response_model=SearchOut)
@@ -51,7 +58,7 @@ async def search(
     limiters: LimitersDep,
     ip: ClientIpDep,
     selfies: list[UploadFile] = File(...),  # noqa: B008
-    # 只在某个相册里找。带上它会被分区裁剪成单分区检索 —— 更快也更精确。
+    # 只在某个相册里找。不带则搜全部相册。
     album: str | None = Form(default=None),
 ) -> SearchOut:
     from api.app.uploads import read_selfie, validate_count
@@ -65,14 +72,16 @@ async def search(
     session_limiter.check(f"search:{session}")
     ip_limiter.check(f"search:{ip}")
 
-    # 收集全部自拍中检测到的人脸向量。
-    # 多张自拍取均值 —— 等价于一个角度更中性、更稳的查询点，是最便宜的召回率提升手段。
+    # 每张自拍只取**最明显的一张脸**（面积最大者），筛选在 embedding 服务端完成，
+    # 其余人脸根本不会被向量化 —— 用户要找的是自己，背景里的路人不该参与匹配。
+    #
+    # 多张自拍时取均值：库里不做 person 聚类，所以这是唯一还剩的召回率提升手段
+    # （多角度的均值是一个更中性、对侧脸更宽容的查询点）。
     vectors: list[list[float]] = []
-    faces_detected = 0
     for upload in selfies:
         payload = await read_selfie(upload, settings)
         try:
-            result = await embedding.extract(payload, filename="selfie")
+            result = await embedding.extract(payload, filename="selfie", primary_only=True)
         except EmbeddingServiceError:
             log.exception("embedding_unavailable")
             raise
@@ -80,19 +89,16 @@ async def search(
             # 显式丢弃引用。CPython 会立即回收，缩短人脸字节在内存中的存活时间。
             del payload
 
-        faces_detected += len(result.faces)
         if result.faces:
-            # 一张自拍里若有多张脸（例如背景里的人），取面积最大的那张 —— 那是拍摄者本人
-            largest = max(result.faces, key=lambda f: f.bbox[2] * f.bbox[3])
-            vectors.append(largest.embedding)
+            vectors.append(result.faces[0].embedding)
 
     latency_ms = int((time.perf_counter() - started) * 1000)
 
     if not vectors:
-        await _audit(db, session, ip, settings, album_filter, faces_detected, 0, 0, latency_ms)
+        await _audit(db, session, ip, settings, album_filter, 0, 0, 0, latency_ms)
         return SearchOut(
             matches=[],
-            faces_detected=0,
+            faces_used=0,
             status="no_face",
             message="没有在照片里检测到人脸。请用光线充足、正面清晰的自拍再试一次。",
             latency_ms=latency_ms,
@@ -108,8 +114,8 @@ async def search(
         ip,
         settings,
         album_filter,
-        faces_detected,
-        outcome.person_candidates,
+        len(vectors),
+        outcome.candidates_scanned,
         len(outcome.matches),
         latency_ms,
     )
@@ -129,15 +135,14 @@ async def search(
     log.info(
         "search_done",
         album=album_filter,
-        faces_detected=faces_detected,
-        person_candidates=outcome.person_candidates,
+        faces_used=len(vectors),
         results=len(matches),
         latency_ms=latency_ms,
     )
 
     return SearchOut(
         matches=matches,
-        faces_detected=faces_detected,
+        faces_used=len(vectors),
         status="ok" if matches else "no_match",
         message=None
         if matches
@@ -162,7 +167,7 @@ async def _audit(
     ip: str,
     settings: Settings,
     album: str | None,
-    faces_detected: int,
+    faces_used: int,
     candidates: int,
     results: int,
     latency_ms: int,
@@ -173,7 +178,7 @@ async def _audit(
             session_hash=audit_hash(session, settings),
             ip_hash=audit_hash(ip, settings),
             album_filter=album,
-            faces_detected=faces_detected,
+            faces_detected=faces_used,
             candidate_count=candidates,
             result_count=results,
             latency_ms=latency_ms,
