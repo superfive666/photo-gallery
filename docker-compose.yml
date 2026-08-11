@@ -1,6 +1,12 @@
 # Dockerfile 全部在 docker/ 下，见 docker/README.md
 name: photo-gallery
 
+# 四个可构建服务都同时声明 build 与 image：
+#   - 本地开发：`docker compose build` 构建出 photo-gallery/<svc>:dev
+#   - 构建机(.15)：设 IMAGE_REPO/IMAGE_TAG 后 build + push 到内网 registry
+#   - 生产机(.12)：只 `docker compose pull`，从不构建
+# 没有 image 字段就没法 pull —— 这是两台机器分离的前提。见 docs/deployment.md。
+
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -22,12 +28,14 @@ services:
       retries: 10
 
   embedding:
+    image: ${IMAGE_REPO:-photo-gallery}/embedding:${IMAGE_TAG:-dev}
     build:
       context: .
       dockerfile: docker/Dockerfile.embedding
       args:
         # true 时把已锁定的 CPU 版 onnxruntime 换成同版本的 onnxruntime-gpu，
         # 同时要设 EMBEDDING_USE_GPU=true 并给容器挂上 GPU。见 docker/README.md。
+        # CI 构建固定为 true（唯一的部署目标有 GPU），本地默认 false。
         EMBEDDING_GPU: ${EMBEDDING_GPU:-false}
     restart: unless-stopped
     environment:
@@ -57,6 +65,7 @@ services:
       start_period: 90s
 
   api:
+    image: ${IMAGE_REPO:-photo-gallery}/api:${IMAGE_TAG:-dev}
     build:
       context: .
       dockerfile: docker/Dockerfile.api
@@ -77,6 +86,7 @@ services:
       start_period: 20s
 
   web:
+    image: ${IMAGE_REPO:-photo-gallery}/web:${IMAGE_TAG:-dev}
     build:
       context: .
       dockerfile: docker/Dockerfile.web
@@ -84,14 +94,19 @@ services:
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
     restart: unless-stopped
     ports:
-      # 生产环境前面还有一层反向代理负责 HTTPS
-      - "${WEB_PORT:-8080}:80"
+      # 生产环境前面还有一层反向代理负责 HTTPS，所以生产 .env 里
+      # WEB_BIND=127.0.0.1 —— 只有本机的反向代理能连上这个端口。
+      #
+      # ⚠️ 这不只是「少开一个端口」：nginx.conf 里用 real_ip 信任了
+      # X-Forwarded-For，一旦这个端口对外可达，客户端就能伪造它绕过限流。
+      - "${WEB_BIND:-0.0.0.0}:${WEB_PORT:-8080}:80"
     depends_on:
       api:
         condition: service_healthy
 
   # 一次性容器：不随 `up` 启动，由 `docker compose run --rm jobs ...` 或 CI 触发
   jobs:
+    image: ${IMAGE_REPO:-photo-gallery}/jobs:${IMAGE_TAG:-dev}
     build:
       context: .
       dockerfile: docker/Dockerfile.jobs

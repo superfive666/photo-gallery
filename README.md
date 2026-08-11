@@ -92,6 +92,22 @@ CI 用 `uv sync --frozen`：改了依赖但忘记提交 `uv.lock` 会直接失�
 
 ---
 
+## 部署
+
+两台内网机器：一台无 GPU 只负责构建镜像并推内网 registry，一台有 GPU 只负责
+`pull → 迁移 → 滚动重启`。构建机不接触 `.env` 与数据库，生产机不执行测试代码。
+
+从裸 Ubuntu 到上线的逐步 runbook 见 [`docs/deployment.md`](docs/deployment.md)；
+分支模型与 workflow 布局见 [`docs/cicd.md`](docs/cicd.md)。
+
+```bash
+# 生产机上叠加 GPU 层（写在 .env 里，这样手敲命令也一致）
+COMPOSE_FILE=docker-compose.yml:docker-compose.gpu.yml
+EMBEDDING_USE_GPU=true
+```
+
+---
+
 ## 已知局限
 
 这些是人脸识别的固有局限，不是 bug，请提前对使用者做预期管理：

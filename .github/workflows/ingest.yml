@@ -1,6 +1,6 @@
 name: Ingest
 
-# 定时增量建库。自建 runner（需要访问生产数据库与源站）。
+# 定时增量建库。跑在生产机（.12）上：需要访问生产数据库、GPU 上的 embedding 服务与源站。
 on:
   schedule:
     # ⚠️ cron 是 UTC。这里是新加坡时间次日 02:00（UTC+8）。
@@ -30,18 +30,35 @@ jobs:
   ingest:
     runs-on: [self-hosted, linux, x64, zrc-prod]
     if: github.repository == 'superfive666/photo-gallery'
-    # 大相册全量重跑可能要几小时（CPU 推理 0.1~0.3s/张）
+    # 大相册全量重跑可能要几小时
     timeout-minutes: 480
 
+    env:
+      DEPLOY_DIR: ${{ vars.DEPLOY_DIR || '/opt/photo-gallery' }}
+
     steps:
+      # 不需要仓库代码 —— 用的是**当前已部署**那个版本的镜像，而不是 HEAD。
+      # checkout 只为了给 upload-artifact 一个存在的工作区。
       - uses: actions/checkout@v4
+
+      # 用**已部署**的 tag，不用 latest：latest 可能已经指向一个还没上线的构建，
+      # 那会让定时任务偷偷跑上一个未经部署验证的版本。
+      - name: 取当前已部署的镜像 tag
+        run: |
+          set -eu
+          cd "$DEPLOY_DIR"
+          test -f .deployed-tag || { echo "::error::还没有成功部署过，先跑 Deploy"; exit 1; }
+          echo "IMAGE_TAG=$(cat .deployed-tag)" >> "$GITHUB_ENV"
 
       - name: 确认服务在运行
         run: |
+          set -eu
+          cd "$DEPLOY_DIR"
           docker compose up -d db embedding
           # embedding 加载模型需要时间，等它 healthy 再开始
           for _ in $(seq 1 30); do
-            if [ "$(docker compose ps -q embedding | xargs docker inspect -f '{{.State.Health.Status}}')" = "healthy" ]; then
+            status=$(docker compose ps -q embedding | xargs docker inspect -f '{{.State.Health.Status}}')
+            if [ "$status" = "healthy" ]; then
               exit 0
             fi
             sleep 5
@@ -55,7 +72,9 @@ jobs:
           args=""
           if [ -n "${{ inputs.album }}" ]; then args="$args --album ${{ inputs.album }}"; fi
           if [ "${{ inputs.full }}" = "true" ]; then args="$args --full"; fi
-          docker compose run --rm jobs python -m jobs ingest $args | tee ingest-report.json
+          cd "$DEPLOY_DIR"
+          docker compose run --rm jobs python -m jobs ingest $args \
+            | tee "$GITHUB_WORKSPACE/ingest-report.json"
 
       - name: 上传报告
         if: always()

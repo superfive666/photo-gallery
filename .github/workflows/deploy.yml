@@ -1,6 +1,11 @@
 name: Deploy
 
-# 自建 runner。只由 main 分支的 push 和手动触发驱动 —— 绝不接受 pull_request。
+# 两台自建 runner：
+#   build  → zrc-ci   (192.168.0.15, 无 GPU) 构建镜像并推内网 registry
+#   deploy → zrc-prod (192.168.0.12, 有 GPU) 只 pull / migrate / up，从不构建
+# 构建机永不接触 .env 和生产数据库；生产机永不执行测试代码。见 docs/deployment.md。
+#
+# 只由 main 分支的 push 和手动触发驱动 —— 绝不接受 pull_request。
 # fork 的 PR 永远不该在家用机器上执行代码。见 docs/cicd.md 的安全前提。
 on:
   push:
@@ -9,60 +14,121 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 # 部署不允许并发：两个部署同时改数据库和容器状态会互相踩。
 concurrency:
   group: deploy-production
   cancel-in-progress: false
 
+env:
+  # 内网 registry。仓库 Variables 里设 IMAGE_REPO 可覆盖（例如换成 GHCR）。
+  IMAGE_REPO: ${{ vars.IMAGE_REPO || '192.168.0.15:5000/photo-gallery' }}
+
 jobs:
-  deploy:
-    # 用标签精确选中生产机，避免误跑到别的自建 runner 上
-    runs-on: [self-hosted, linux, x64, zrc-prod]
+  build:
+    name: 构建并推镜像（.15）
+    runs-on: [self-hosted, linux, x64, zrc-ci]
 
     # 双保险：即使有人误加了 pull_request 触发，来自 fork 的事件也会在这里被拦掉
     if: github.repository == 'superfive666/photo-gallery' && github.event_name != 'pull_request'
 
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+
+    env:
+      # 唯一的部署目标有 GPU，所以只构建 GPU 变体。
+      # onnxruntime-gpu 在没有 CUDA 的机器上也能 import，providers 里有 CPU 兜底。
+      EMBEDDING_GPU: 'true'
+      VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL || '/api' }}
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: 确认 .env 就位
-        run: |
-          # 生产 .env 存在服务器上，不经过 GitHub。缺失就中止，别用默认密码起服务。
-          test -f .env || { echo "服务器上缺少 .env"; exit 1; }
-          # 权限必须是 600
-          perms=$(stat -c "%a" .env)
-          test "$perms" = "600" || { echo ".env 权限是 $perms，应为 600"; exit 1; }
+      - name: 计算镜像 tag
+        id: meta
+        run: echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-      - name: 记录当前镜像用于回滚
+      # tools profile 把一次性容器 jobs 也带进来 —— 迁移要用它
+      - name: 构建
+        env:
+          IMAGE_TAG: ${{ steps.meta.outputs.tag }}
+        run: docker compose --profile tools build
+
+      # 逐个 push 而不是 `docker compose push`：后者会把 db 的上游镜像
+      # （pgvector/pgvector）也一并尝试推送，那是别人的 repository，必然失败。
+      - name: 推到 registry
+        env:
+          IMAGE_TAG: ${{ steps.meta.outputs.tag }}
         run: |
-          # 给当前运行的镜像打一个 rollback tag。失败时直接用这些 tag 重启即可，
-          # 不需要在 workflow 里传递 image id。
-          for svc in api web embedding; do
-            id=$(docker compose images -q "$svc" 2>/dev/null || true)
-            if [ -n "$id" ]; then
-              docker tag "$id" "photo-gallery-rollback-$svc:previous"
-              echo "已标记 $svc 的回滚镜像"
-            else
-              echo "$svc 当前未运行（首次部署），无回滚目标"
-            fi
+          set -eu
+          for svc in api jobs web embedding; do
+            docker push "$IMAGE_REPO/$svc:$IMAGE_TAG"
+            # 同时推一个 latest，方便人工排查时不用记 sha
+            docker tag "$IMAGE_REPO/$svc:$IMAGE_TAG" "$IMAGE_REPO/$svc:latest"
+            docker push "$IMAGE_REPO/$svc:latest"
           done
 
-      - name: 构建镜像
-        run: docker compose build
+      - name: 清理悬空镜像
+        if: always()
+        # 构建机磁盘会被历史层吃满，尤其是 GB 级的 embedding 镜像
+        run: docker image prune -f --filter "until=72h"
+
+  deploy:
+    name: 部署（.12）
+    needs: build
+    runs-on: [self-hosted, linux, x64, zrc-prod]
+
+    env:
+      # 生产状态目录：.env、compose 文件、schema、上次部署的 tag 都在这里。
+      # ⚠️ 绝不能用 runner 的工作区 —— actions/checkout 会 git clean -ffdx，
+      # 连 gitignore 的 .env 一起删掉，第二次部署就会带着默认密码起服务。
+      DEPLOY_DIR: ${{ vars.DEPLOY_DIR || '/opt/photo-gallery' }}
+      IMAGE_TAG: ${{ needs.build.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查生产目录与 .env
+        run: |
+          set -eu
+          test -d "$DEPLOY_DIR" || { echo "::error::$DEPLOY_DIR 不存在，先按 docs/deployment.md 初始化生产机"; exit 1; }
+          # 生产 .env 只存在于这台机器上，不经过 GitHub。缺失就中止，别用默认密码起服务。
+          test -f "$DEPLOY_DIR/.env" || { echo "::error::缺少 $DEPLOY_DIR/.env"; exit 1; }
+          perms=$(stat -c "%a" "$DEPLOY_DIR/.env")
+          test "$perms" = "600" || { echo "::error::.env 权限是 $perms，应为 600"; exit 1; }
+
+      # compose 文件与迁移 SQL 从仓库同步过去；.env 与数据卷留在原地不动。
+      - name: 同步 compose 与 schema
+        run: |
+          set -eu
+          install -m 644 docker-compose.yml docker-compose.gpu.yml "$DEPLOY_DIR/"
+          mkdir -p "$DEPLOY_DIR/docs"
+          rm -rf "$DEPLOY_DIR/docs/schema"
+          cp -r docs/schema "$DEPLOY_DIR/docs/schema"
+
+      - name: 拉取镜像
+        run: |
+          cd "$DEPLOY_DIR"
+          docker compose --profile tools pull
 
       # 迁移必须在新代码启动之前。DDL 只做向后兼容的新增，所以旧代码在这个窗口期
       # 仍能正常工作。反过来（先换代码后迁移）会有一段新代码访问不存在列的时间。
       - name: 执行数据库迁移
-        run: docker compose run --rm jobs python -m jobs migrate
+        run: |
+          cd "$DEPLOY_DIR"
+          docker compose up -d db
+          docker compose run --rm jobs python -m jobs migrate
 
       - name: 滚动重启
-        run: docker compose up -d --no-deps embedding api web
+        id: restart
+        run: |
+          cd "$DEPLOY_DIR"
+          docker compose up -d --no-deps embedding api web
 
       - name: 健康检查
         id: health
         run: |
+          cd "$DEPLOY_DIR"
           for attempt in $(seq 1 30); do
             if docker compose exec -T api python -c "
           import sys, urllib.request
@@ -80,31 +146,34 @@ jobs:
           echo "::error::健康检查在 150 秒内未通过"
           exit 1
 
-      - name: 失败则回滚
-        if: failure() && steps.health.outcome == 'failure'
+      - name: 记录本次已知良好的 tag
         run: |
-          echo "::warning::健康检查未通过，回滚到上一组镜像"
+          cd "$DEPLOY_DIR"
+          echo "$IMAGE_TAG" > .deployed-tag
+          echo "已部署 $IMAGE_TAG"
+
+      # 只在「已经动过运行中的容器」之后才回滚。
+      # 前面几步（校验 .env、pull、migrate）失败时旧版本还在正常服务，
+      # 这时候 force-recreate 一遍只会白白中断一次服务。
+      - name: 失败则回滚
+        if: failure() && (steps.restart.outcome == 'failure' || steps.health.outcome == 'failure')
+        run: |
+          set -eu
+          cd "$DEPLOY_DIR"
           # 只回滚镜像，不回滚数据库 —— DDL 是向后兼容的新增，旧代码在新 schema 上能正常工作。
           # 这正是「先迁移、后换代码」这个顺序换来的好处。
-          missing=0
-          for svc in api web embedding; do
-            if ! docker image inspect "photo-gallery-rollback-$svc:previous" >/dev/null 2>&1; then
-              echo "::error::$svc 没有可回滚的镜像（可能是首次部署）"
-              missing=1
-              continue
-            fi
-            # compose 用 build 出的镜像名，这里直接覆盖同名 tag 后重启
-            docker tag "photo-gallery-rollback-$svc:previous" "photo-gallery-$svc:latest"
-          done
-          if [ "$missing" = "1" ]; then
-            echo "::error::回滚不完整，需要人工介入"
+          if [ ! -f .deployed-tag ]; then
+            echo "::error::没有上一次成功部署的记录（首次部署？），需要人工介入"
             exit 1
           fi
-          docker compose up -d --no-deps --force-recreate embedding api web
+          prev=$(cat .deployed-tag)
+          echo "::warning::健康检查未通过，回滚到 $prev"
+          IMAGE_TAG="$prev" docker compose up -d --no-deps --force-recreate embedding api web
           # 无论回滚是否成功，这次部署都算失败
           exit 1
 
       - name: 清理悬空镜像
         if: always()
-        # 家用机器磁盘有限，每次部署都会留下旧镜像层
+        # 家用机器磁盘有限，每次部署都会留下旧镜像层。
+        # until=168h：保证至少一周内的版本还能直接换 tag 回滚，不用重新拉。
         run: docker image prune -f --filter "until=168h"
