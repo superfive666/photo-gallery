@@ -26,9 +26,9 @@ services:
       context: .
       dockerfile: docker/Dockerfile.embedding
       args:
-        # CPU 版用 onnxruntime；有 NVIDIA GPU 时改成 onnxruntime-gpu 并设
-        # EMBEDDING_USE_GPU=true（还需要 nvidia container runtime）。见 docker/README.md。
-        ORT_PACKAGE: ${ORT_PACKAGE:-onnxruntime}
+        # true 时把已锁定的 CPU 版 onnxruntime 换成同版本的 onnxruntime-gpu，
+        # 同时要设 EMBEDDING_USE_GPU=true 并给容器挂上 GPU。见 docker/README.md。
+        EMBEDDING_GPU: ${EMBEDDING_GPU:-false}
     restart: unless-stopped
     environment:
       MODEL_NAME: ${MODEL_NAME}

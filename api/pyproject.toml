@@ -1,0 +1,22 @@
+[project]
+name = "api"
+version = "0.1.0"
+description = "FastAPI：邀请码鉴权 + 人脸检索 + 缩略图分发"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    # DB 模型、embedding 客户端、配置、向量工具都来自这里
+    # [db] 带上 sqlalchemy / asyncpg / pgvector
+    "gallery-core[db]",
+    "fastapi>=0.115.6",
+    "uvicorn[standard]>=0.34",
+    "python-multipart>=0.0.20",
+    "pyjwt>=2.10",
+    "argon2-cffi>=23.1",
+]
+
+[tool.uv]
+# 不构建成包：代码通过源码目录导入（api 包就是本目录本身，见根 pyproject 的说明）
+package = false
+
+[tool.uv.sources]
+gallery-core = { workspace = true }

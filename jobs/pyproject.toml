@@ -1,0 +1,22 @@
+[project]
+name = "jobs"
+version = "0.1.0"
+description = "离线任务：拉取源站相册、批量提取人脸、落库、阈值评估"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    # [db] 带上 sqlalchemy / asyncpg / pgvector
+    "gallery-core[db]",
+    # 缩略图生成（源站没提供时）
+    "pillow>=11.1",
+    # 解析源站相册页
+    "lxml>=5.3",
+    # jobs/eval.py 直接调用 api 里那份真实的检索函数，见 docs/architecture.md 第 6 节
+    "api",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+gallery-core = { workspace = true }
+api = { workspace = true }

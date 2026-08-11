@@ -1,4 +1,75 @@
-# 全 Python 组件（api / jobs / libs / embedding）共用一套 lint 与类型检查配置。
+# uv workspace 根。
+#
+# 四个成员：libs / api / jobs / embedding，共用**一个** uv.lock ——
+# 这是用 workspace 而不是四份独立 requirements.txt 的全部理由：
+# 三个服务共享 sqlalchemy / pydantic / numpy 等一大堆依赖，一份锁文件保证它们在
+# 所有镜像里解析到完全相同的版本。否则 api 和 jobs 各自解析出不同的 numpy，
+# 而 embedding 又是第三个版本 —— 向量库的行为差异会以「检索结果不对」的形式出现，
+# 且极难定位。
+#
+# 只有 libs 是真正会被构建安装的包（gallery-core）。api / jobs / embedding 都是
+# `package = false` 的虚拟成员：uv 只负责锁定并安装它们的依赖，代码本身通过
+# 源码目录导入（见下面的 pytest.pythonpath / mypy.mypy_path）。
+# 这样不必为了迁移到 uv 而把三个服务全部改成 src/ 布局。
+#
+# 常用命令：
+#   uv sync --all-packages          本地开发：装齐所有成员 + dev 依赖
+#   uv sync --package api --no-dev  只装 api 的运行时依赖（Docker 用）
+#   uv run pytest                   跑测试（无需手动设 PYTHONPATH）
+#   uv lock --upgrade               升级依赖并刷新 uv.lock
+
+[project]
+name = "photo-gallery"
+version = "0.1.0"
+description = "以自拍检索 photos.zrc.sg 历史活动相册中的本人照片"
+requires-python = ">=3.11,<3.12"
+# 根本身不装任何运行时依赖，它只是 workspace 的容器
+dependencies = []
+
+[tool.uv]
+# 根不是一个要发布的包，不要构建它
+package = false
+
+# insightface 硬依赖 `opencv-python`（带 GUI 的那个），与我们显式声明的
+# opencv-python-headless 重复：两者提供同一个 cv2 模块，多出约 50MB，且非 headless 版
+# 需要 libGL。服务端一律用 headless，所以把这条传递依赖摘掉。
+#
+# 手法是覆盖成一个永不成立的 marker —— 这是 uv 用来「删掉某条传递依赖」的常规做法。
+# ⚠️ override 是**全局按包名**生效的，会连带覆盖我们自己声明的同名依赖。所以这里只放
+# 真正想彻底消失的包；想替换版本的场景不能用它（onnxruntime 就是因为这个原因没走
+# extra 方案，见 embedding/pyproject.toml 与 docker/Dockerfile.embedding）。
+# insightface 换版本时要重新确认这条覆盖仍然安全。
+override-dependencies = [
+    "opencv-python ; sys_platform == 'nonexistent'",
+]
+
+[tool.uv.workspace]
+members = ["libs", "api", "jobs", "embedding"]
+
+[dependency-groups]
+# 开发工具集中在根：四个成员用同一套 lint 与测试工具，版本必须一致，
+# 否则 CI 和本地会给出不同的结论。
+dev = [
+    "ruff>=0.8.4",
+    "mypy>=1.14",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    # api/jobs 的测试要 import 到这三个成员的代码
+    "api",
+    "jobs",
+    "embedding",
+    "gallery-core",
+]
+
+[tool.uv.sources]
+api = { workspace = true }
+jobs = { workspace = true }
+embedding = { workspace = true }
+gallery-core = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# 以下配置四个成员共用
+# ---------------------------------------------------------------------------
 
 [tool.ruff]
 line-length = 100
@@ -27,7 +98,10 @@ known-first-party = ["api", "jobs", "embedding", "gallery_core"]
 python_version = "3.11"
 strict = true
 warn_unreachable = true
-plugins = []
+# api / jobs / embedding 三个包都在仓库根下同名目录里，所以导入根就是仓库根。
+# 写在这里，命令行就不必再带 PYTHONPATH。
+mypy_path = "."
+
 # 第三方库缺 stub 的不阻塞
 [[tool.mypy.overrides]]
 module = ["insightface.*", "cv2.*", "onnxruntime.*", "lxml.*"]
@@ -36,4 +110,6 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["api/tests", "jobs/tests", "libs/tests"]
+# 与 mypy_path 同理：`uv run pytest` 直接可用，不需要设 PYTHONPATH
+pythonpath = ["."]
 filterwarnings = ["error::DeprecationWarning"]

@@ -25,6 +25,7 @@
 | `libs/gallery_core/` | `api` 与 `jobs` 共享的 Python 包（DB 模型、embedding 客户端、配置） |
 | `docker/` | 全部 Dockerfile |
 | `.github/workflows/` | CI/CD（self-hosted runner） |
+| `pyproject.toml` + `uv.lock` | **uv workspace**：四个 Python 成员共用一份锁文件 |
 
 > `embedding/` 与 `libs/` 是在原定结构上追加的两个目录。前者来自「embedding 走独立容器」的选型；
 > 后者用于避免 `api` 与 `jobs` 的 DB 模型和预处理逻辑各自漂移 —— 这类漂移会直接导致检索静默失效。
@@ -59,7 +60,11 @@
 
 ## 快速开始
 
+Python 依赖用 [uv](https://docs.astral.sh/uv/) 管理（workspace + 单一 `uv.lock`），
+前端仍用 npm。
+
 ```bash
+uv sync --all-packages             # 或 make install：按 uv.lock 装齐依赖
 cp .env.example .env               # 填入 INVITE_CODE_HASH / JWT_SECRET / AUDIT_HASH_SALT
 make up                            # 起 postgres + embedding + api + web
 make migrate                       # 执行 docs/schema 下的 DDL
@@ -68,9 +73,22 @@ make ingest ALBUM=2026-08-10       # 批量拉取 + embedding + 落库
 open http://localhost:8080
 ```
 
-`INVITE_CODE_HASH` 用 `python -m api.app.tools.hash_invite` 生成（明文邀请码不进 .env）。
+`INVITE_CODE_HASH` 用 `uv run python -m api.app.tools.hash_invite` 生成
+（明文邀请码不进 .env）。
 
 常用命令见 `make help`。
+
+### 依赖怎么加
+
+```bash
+# 改对应成员的 pyproject.toml（api / jobs / embedding / libs），然后
+uv lock            # 刷新 uv.lock —— 必须一起提交
+uv sync --all-packages
+```
+
+CI 用 `uv sync --frozen`：改了依赖但忘记提交 `uv.lock` 会直接失败，这是故意的。
+`libs/pyproject.toml` 里的 DB 依赖在 `[db]` extra 中 —— embedding 服务不碰数据库，
+所以它的镜像里没有 sqlalchemy / asyncpg / pgvector。
 
 ---
 

@@ -54,8 +54,10 @@ main  ──●────────●────────●───�
 
 并行三个 job：
 
-- `python` — `ruff check`、`ruff format --check`、`mypy --strict`、`pytest`
-  （用 service container 起 `pgvector/pgvector:pg16` 跑集成测试）
+- `python` — `uv sync --all-packages --frozen` 之后跑 `ruff check`、
+  `ruff format --check`、`mypy --strict`、迁移、`pytest`
+  （用 service container 起 `pgvector/pgvector:pg16`）。
+  `--frozen` 顺带守卫「改了依赖但忘记提交 `uv.lock`」—— 那种情况会直接失败。
 - `web` — `npm ci`、`tsc --noEmit`、`eslint`、`vitest run`、`npm run build`
 - `docker` — 四个 Dockerfile 都 `docker build`，验证可构建，**不 push**
 
@@ -90,8 +92,8 @@ on:
       full:  { description: "全量重跑", type: boolean, default: false }
 ```
 
-跑 `docker compose run --rm jobs ingest`。聚类在 ingest 之后自动跟一次
-（新照片会产生新的 face，簇需要更新）。
+跑 `docker compose run --rm jobs ingest`。没有后续步骤 —— 检索是实时的，
+不做聚类（见 `plans/0003`）。
 
 > cron 的时区是 UTC，写的时候记得换算 —— 这是最常踩的坑。
 
@@ -103,8 +105,10 @@ on:
   比自建 registry 省事，且自建 runner 拉取自己家网络出口也够快。
 - Tag 规则：`sha-<short>`（每次构建）+ `latest`（main）。
   部署时用 `sha-` tag，回滚就是换 tag 重启。
-- `embedding` 镜像含模型权重（约 +300MB），只在 `embedding/` 或模型版本变化时重建 ——
-  用 `paths` 过滤避免每次 PR 都重建它。
+- `embedding` 镜像含模型权重（约 +300MB），只在 `embedding/`、`uv.lock` 或模型版本
+  变化时重建 —— 用 `paths` 过滤避免每次 PR 都重建它。
+- 依赖变更由 `uv.lock` 唯一决定，所以「同一个 commit 构建出的镜像装的是同一批版本」
+  这件事是有保证的（Dockerfile 用 `uv sync --frozen`）。
 
 ## Secrets
 
@@ -113,8 +117,9 @@ on:
 | `POSTGRES_PASSWORD` | DB 密码 |
 | `JWT_SECRET` | session 签名 |
 | `INVITE_CODE_HASH` | 邀请码的 argon2 hash（不存明文） |
-| `SOURCE_BASE_URL` / `SOURCE_TOKEN` | 源站访问 |
-| `SIGNED_URL_SECRET` | 原图短效链接签名 |
+| `AUDIT_HASH_SALT` | `search_audit` 里 hash session/ip 的盐 |
+
+源站公开无鉴权，所以没有 `SOURCE_TOKEN`；不签名原图链接，所以没有 `SIGNED_URL_SECRET`。
 
 - 生产 `.env` 存在自建服务器上，由 runner 读取，**不经过 GitHub**。
   GitHub secrets 只放部署本身需要的东西。

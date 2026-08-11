@@ -1,29 +1,35 @@
 # 离线任务。一次性容器，由 `docker compose run --rm jobs ...` 或 CI 触发。
 FROM python:3.11-slim
 
+COPY --from=ghcr.io/astral-sh/uv:0.8.17 /uv /uvx /bin/
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never
 
 WORKDIR /app
 
-COPY jobs/requirements.txt ./jobs/requirements.txt
-RUN pip install -r jobs/requirements.txt
+# 依赖层，说明见 Dockerfile.api
+COPY pyproject.toml uv.lock .python-version ./
+COPY api/pyproject.toml       api/pyproject.toml
+COPY jobs/pyproject.toml      jobs/pyproject.toml
+COPY embedding/pyproject.toml embedding/pyproject.toml
+COPY libs libs
 
-COPY libs ./libs
-RUN pip install -e ./libs
+# jobs 声明了对 api 的依赖（eval.py 直接调用 api 里那份真实的检索函数），
+# 所以这一步也会带上 api 的运行时依赖。
+RUN uv sync --frozen --no-dev --package jobs
 
-COPY jobs ./jobs
-# 测试也进镜像：`make test-py` 直接在这个容器里跑，无需宿主机装 Python 环境
-COPY api ./api
-COPY pyproject.toml ./pyproject.toml
+COPY jobs jobs
+# eval.py 要 import api.app.services.search
+COPY api api
 
-# jobs/ 下是 jobs 包本身，加进 PYTHONPATH 才能 `python -m jobs`
-ENV PYTHONPATH=/app:/app/jobs
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONPATH=/app
 
-RUN useradd --create-home --uid 10001 appuser \
-    && mkdir -p /tmp/ingest \
-    && chown appuser:appuser /tmp/ingest
+RUN useradd --create-home --uid 10001 appuser
 USER appuser
 
 # 默认不做任何事，由 compose run 指定子命令

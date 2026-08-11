@@ -210,8 +210,17 @@ JSON 里。存二进制 + 由 `/api/photos/{id}/thumb` 单独分发的好处：P
 向量归一化工具、UUIDv7 生成、配置读取。
 
 复制两份的失效模式非常隐蔽：某天有人只在 `jobs` 里改了归一化或阈值常量，在线检索仍然
-「正常返回结果」，只是结果全错。没有任何测试会红。所以这部分强制共享，通过
-`pip install -e ./libs` 装进两个镜像。
+「正常返回结果」，只是结果全错。没有任何测试会红。所以这部分强制共享。
+
+依赖用 **uv workspace** 管理：根 `pyproject.toml` 是 workspace 根，`libs`/`api`/`jobs`/
+`embedding` 四个成员共用**一份 `uv.lock`**。这一份锁文件是关键 —— 三个服务共享
+sqlalchemy / pydantic / numpy 等一大堆依赖，共用一份锁才能保证它们在所有镜像里解析到
+完全相同的版本。否则 api 与 jobs 各自解析出不同的 numpy，向量的行为差异同样会以
+「检索结果不对」的形式出现。
+
+`gallery-core` 是四个成员里唯一会被构建安装的包；另外三个是 `package = false` 的虚拟
+成员（uv 只锁定并安装它们的依赖，代码按源码目录导入）。DB 栈放在 `gallery-core[db]`
+extra 里，所以 embedding 镜像里没有 sqlalchemy / asyncpg / pgvector。
 
 同理，`jobs/eval.py` 直接 import `api.app.services.search` 里那份**真实的**检索函数 ——
 评估必须走线上代码路径，否则测出来的指标和线上行为无关。

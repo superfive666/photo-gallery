@@ -43,20 +43,30 @@
 
 ```bash
 make help          # 全部命令
+make install       # uv sync --all-packages（本地开发装齐依赖）
 make up / down     # 起停 compose
 make migrate       # 顺序执行 docs/schema/*.sql
 make probe ALBUM=x  # 探查源站页面结构，不写库
 make ingest ALBUM=x # 批量离线建库
 make test          # api + jobs 的 pytest，web 的 vitest
 make lint          # ruff + mypy + eslint + prettier
+make lock          # uv lock --upgrade（升级依赖）
 make eval          # 跑阈值评估集，输出 precision/recall
 ```
 
 ## 代码约定
 
-- Python 3.11，`ruff` + `mypy --strict`（`libs`/`api`/`jobs`/`embedding` 同一套配置）。
+- Python 3.11，`ruff` + `mypy --strict`（`libs`/`api`/`jobs`/`embedding` 同一套配置，
+  都写在根 `pyproject.toml` 里）。
 - SQLAlchemy 2.0 风格（`Mapped[...]` 注解），异步引擎。
-- 共享代码放 `libs/gallery_core`，通过 `pip install -e ./libs` 进入 `api` 与 `jobs` 镜像。
+- **依赖用 uv workspace 管理。** 根 `pyproject.toml` 是 workspace 根，四个成员
+  `libs`/`api`/`jobs`/`embedding` 各有自己的 `pyproject.toml`，共用**一份** `uv.lock`。
+  加依赖就改对应成员的 `pyproject.toml` 再 `uv lock`，**改完必须提交 uv.lock** ——
+  CI 用 `--frozen`，锁文件没跟上会直接失败（这是故意的）。
+  不要再写 `requirements.txt`，也不要在容器里 `pip install`。
+- 共享代码放 `libs/gallery_core`（包名 `gallery-core`），是四个成员里唯一会被真正构建
+  安装的包；`api`/`jobs`/`embedding` 都是 `package = false` 的虚拟成员，代码按源码目录导入。
+  DB 依赖在 `gallery-core[db]` extra 里 —— embedding 服务不碰数据库，别把它加回去。
 - 前端：React 19 + TS strict + Tailwind。组件按 `src/components/` 平铺，业务逻辑进 `src/hooks/`。
 - 前端设计相关工作请使用 `web/.claude/skills/` 下的 `design-system` 与 `ui-ux-pro_max` 两个 skill。
 - 提交信息用中文或英文均可，但要说清「为什么」而不只是「做了什么」。
