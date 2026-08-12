@@ -4,8 +4,11 @@ name: CI
 # 自建 runner 只用于构建与部署（deploy.yml / ingest.yml），绝不用于 PR 的 CI ——
 # 否则 fork 提的 PR 就能在自建机器上执行任意代码。见 docs/cicd.md。
 #
-# 换句话说：.15（zrc-ci）上的 runner 只执行部署分支上的 `docker compose build`，
-# 不跑测试代码、不装 npm 依赖。「构建机」不等于「什么都在上面跑的机器」。
+# 换句话说：自建 runner 上只执行部署分支上的构建与部署步骤，不跑测试代码、
+# 不装 npm 依赖。「家里的机器上有 runner」不等于「什么都可以在上面跑」。
+#
+# 另外 .15 是 arm64 的 Pi 5，insightface 没有 arm64 预编译 wheel，
+# 这个 job 搬过去大概率要从源码编译 —— 不值当。
 on:
   pull_request:
   push:

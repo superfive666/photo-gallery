@@ -37,28 +37,31 @@ main  ──●────────●────────●───�
 4. Runner 以**非 root 专用账户**运行，不加入 docker 组以外的特权组，
    工作目录与生产数据卷分离。
 5. 每个 job 结束后清理工作区（`actions/checkout` 默认会 clean，但构建缓存要自己管）。
-6. Runner 用标签精确选中，避免误跑到别的机器：
-   - `zrc-ci` = 192.168.0.15，只构建镜像，**没有 `.env`、没有数据库**；
-   - `zrc-prod` = 192.168.0.12，只 pull / 迁移 / 重启，**从不构建、从不跑测试代码**。
+6. Runner 用**标签**精确选中（`runs-on` 匹配 label 而不是 name），避免误跑到别的机器：
+   - `superfive-ubuntu` = 192.168.0.12，构建 + 部署 + 定时建库；
+   - `superfive-pi5` = 192.168.0.15，已注册但目前没有分配 job。
    两台 runner 的账户都在 `docker` 组里 —— 等价于 root，所以「哪台机器上跑什么」
-   就是这个项目最重要的一道边界。
+   就是这个项目最重要的一道边界。**两台都不跑测试代码。**
 
 ---
 
 ## 两台机器
 
-| 机器 | 硬件 | Runner 标签 | 职责 |
+| 机器 | 硬件 | Runner label | 职责 |
 | --- | --- | --- | --- |
-| `192.168.0.15` | 无 GPU | `zrc-ci` | `docker compose build` → push 到 Docker Hub 私有仓库 |
-| `192.168.0.12` | NVIDIA GPU | `zrc-prod` | `pull` → `migrate` → `up -d` → 健康检查；定时 ingest |
+| `192.168.0.12` | x86_64、NVIDIA GPU | `superfive-ubuntu` | 就地 build → migrate → up → 健康检查；定时 ingest |
+| `192.168.0.15` | Raspberry Pi 5、arm64 | `superfive-pi5` | 已注册，目前没有分配 job（备用容量） |
 
-两台机器的 runner 装法完全一样，只有 `--name` / `--labels` 不同 —— 步骤见
-[`deployment.md` 1.2](deployment.md#12-github-actions-runner)。
+**没有镜像仓库**：构建就在要部署的那台机器上做，产物留在本机 docker 里，
+用 `sha-<short>` tag 区分版本。回滚 = 换个 tag 重新 `up`，因为旧镜像还在本机 ——
+所以 `docker image prune` 的一周保留窗口就是回滚能力的唯一来源。
 
-镜像走 Docker Hub 私有仓库；部署靠 `.12` 上的第二个 runner，不走 SSH
-（否则要把生产机私钥交给 CI 平台）。完整理由见
-[`plans/0004-two-host-cicd.md`](plans/0004-two-host-cicd.md#决策与理由)，
-两台机器的逐步配置见 [`deployment.md`](deployment.md)。
+部署靠 `.12` 上的 runner 而不是从别处 SSH 过去（否则要把生产机私钥交给 CI 平台）。
+两台机器的 runner 装法完全一样，只有 `--name` / `--labels` 和架构不同 —— 步骤见
+[`deployment.md` 第 1 节](deployment.md#1-两台机器都要做github-actions-runner)。
+
+> ⚠️ 两台架构不同，所以 `runs-on` 里**不写 `x64`**：写了只会在选错机器时表现为
+> 「永远 Queued」。用机器名做唯一 label 定位。
 
 ---
 
@@ -67,9 +70,8 @@ main  ──●────────●────────●───�
 | 文件 | 触发 | Runner | 作用 |
 | --- | --- | --- | --- |
 | `.github/workflows/ci.yml` | `pull_request`、`push: main` | GitHub 托管 | lint、typecheck、test、docker build（不 push） |
-| `.github/workflows/deploy.yml` job `build` | `push: main`、`workflow_dispatch` | **自建** `zrc-ci` | 构建四个镜像 → 推 Docker Hub（`sha-<short>` + `latest`） |
-| `.github/workflows/deploy.yml` job `deploy` | 同上，`needs: build` | **自建** `zrc-prod` | pull → 迁移 → 滚动重启 → 健康检查 → 失败回滚 |
-| `.github/workflows/ingest.yml` | `schedule`、`workflow_dispatch` | **自建** `zrc-prod` | 定时增量建库（用已部署的 tag，不用 `latest`） |
+| `.github/workflows/deploy.yml` | `push: main`、`workflow_dispatch` | **自建** `superfive-ubuntu` | build → 迁移 → 滚动重启 → 健康检查 → 失败回滚 |
+| `.github/workflows/ingest.yml` | `schedule`、`workflow_dispatch` | **自建** `superfive-ubuntu` | 定时增量建库（用 `.deployed-tag` 里那个版本） |
 
 ### `ci.yml` 内容
 
@@ -86,21 +88,23 @@ main  ──●────────●────────●───�
 
 ### `deploy.yml` 内容
 
-```
-job build  (zrc-ci  = .15)
-  ① checkout
-  ② tag = sha-<short>
-  ③ docker compose --profile tools build   （EMBEDDING_GPU=true）
-  ④ push <tag> 与 latest 到 Docker Hub
+单个 job，全程在 `.12` 上：
 
-job deploy (zrc-prod = .12，needs: build)
-  ⑤ 校验 /opt/photo-gallery/.env 存在且权限 600
-  ⑥ 同步 compose 文件与 docs/schema 过去（.env 与数据卷不动）
-  ⑦ docker compose pull
-  ⑧ migrate            —— 迁移必须在新代码启动之前
-  ⑨ up -d --no-deps embedding api web
-  ⑩ 轮询 /readyz；通过则写 .deployed-tag，失败则用 .deployed-tag 里的旧 tag 重启
 ```
+① checkout
+② IMAGE_TAG = sha-<short>
+③ 校验 /opt/photo-gallery/.env 存在且权限 600
+④ build（在工作区里，但 --env-file 指向生产 .env；EMBEDDING_GPU=true）
+⑤ 同步 compose 文件与 docs/schema 到 /opt/photo-gallery（.env 与数据卷不动）
+⑥ migrate            —— 迁移必须在新代码启动之前
+⑦ up -d --no-deps embedding api web
+⑧ 轮询 /readyz；通过则写 .deployed-tag，失败则用 .deployed-tag 里的旧 tag 重启
+⑨ image prune --filter until=168h
+```
+
+构建在工作区里做（build context 需要源码），运行在 `/opt/photo-gallery` 里做
+（`.env` 和数据卷在那儿）。`--env-file` 把两者接起来，否则 compose 插值会把一堆变量
+解析成空串，只留一串 warning。
 
 生产状态（`.env`、`.deployed-tag`、数据卷）全部在 `/opt/photo-gallery`，
 **不在 runner 工作区** —— `actions/checkout` 的 `git clean -ffdx` 会把 gitignore
@@ -136,17 +140,14 @@ on:
 
 ## 镜像与版本
 
-- 镜像推到 **Docker Hub 私有仓库**。Docker Hub 的仓库名只有两级，所以四个服务是
-  四个仓库：`superfive666/photo-gallery-{api,jobs,web,embedding}`。
-  仓库 Variable `IMAGE_PREFIX` 可改成 GHCR 或内网 registry，workflow 不用动。
-  ⚠️ **Docker Hub 免费版只含 1 个私有仓库**，四个需要 Pro ——
-  见 [`deployment.md` 第 0 节](deployment.md#-私有仓库数量先确认你的-docker-hub-套餐)。
-- GB 级的 GPU 版 embedding 镜像要经家宽上传再下载一遍。按层去重，
-  所以只有第一次疼；改业务代码时只传最后一个小层。
-- Tag 规则：`sha-<short>`（每次构建）+ `latest`（方便人工排查）。
-  部署时用 `sha-` tag；定时 ingest 用 `.deployed-tag` 里那个，**不用 `latest`** ——
-  `latest` 可能已经指向一个还没通过部署验证的构建。
-  回滚就是换 tag 重启。
+- **没有镜像仓库。** 镜像只存在于 `.12` 的 docker 里，名字是
+  `photo-gallery-{api,jobs,web,embedding}:sha-<short>`。
+  以后要引入仓库（GHCR / Docker Hub / 内网 registry）只改 `IMAGE_PREFIX` 一个变量。
+- Tag 规则：`sha-<short>`，每次部署一个。**不用 `latest`** —— 都叫 latest 就没法回滚。
+  定时 ingest 读 `.deployed-tag`，跑的是当前在线的那个版本。
+- 回滚就是换 tag 重新 `up`。前提是旧镜像还在本机，所以
+  `docker image prune --filter until=168h` 的窗口别调短，也别用
+  `docker system prune -a`（会连可回滚的旧版本一起删）。
 - `embedding` 镜像含模型权重（约 +300MB），只在 `embedding/`、`uv.lock` 或模型版本
   变化时重建 —— 用 `paths` 过滤避免每次 PR 都重建它。
 - 依赖变更由 `uv.lock` 唯一决定，所以「同一个 commit 构建出的镜像装的是同一批版本」
@@ -154,17 +155,14 @@ on:
 
 ## Secrets 与 Variables
 
-**这个拓扑下 GitHub Secrets 一个都不需要。** Docker Hub 凭据由两台机器各自
-`docker login` 存在本地（`.15` 读写 token、`.12` 只读 token）、部署靠 `.12` 上的
+**这个拓扑下 GitHub Secrets 一个都不需要。** 没有镜像仓库凭据、部署靠 `.12` 上的
 runner 而不是 SSH 密钥、生产 `.env` 只存在于 `.12` 上 —— 没有任何机密需要经过 GitHub。
-少一处存放就少一处泄漏面。想集中轮换的话，改成 Secrets + `docker/login-action` 也能跑，
-代价是凭据要经过 CI 平台。
+少一处存放就少一处泄漏面。
 
-需要的是几个非机密的 Variables（都有默认值，可以不设）：
+需要的是两个非机密的 Variables（都有默认值，可以不设）：
 
 | Variable | 默认 | 用途 |
 | --- | --- | --- |
-| `IMAGE_PREFIX` | `superfive666/photo-gallery` | 镜像仓库名前缀（`-api`、`-web`… 由 workflow 拼） |
 | `DEPLOY_DIR` | `/opt/photo-gallery` | 生产状态目录 |
 | `VITE_API_BASE_URL` | `/api` | 前端构建期注入的 api 地址 |
 
@@ -182,8 +180,8 @@ runner 而不是 SSH 密钥、生产 `.env` 只存在于 `.12` 上 —— 没有
 首次上线前逐项确认。逐步配置见 [`deployment.md`](deployment.md)。
 
 - [ ] 仓库为 private，或已按上文配置 fork PR 审批
-- [ ] 两个 runner 都以非 root 专用账户运行，标签分别为 `zrc-ci` / `zrc-prod`
-- [ ] 两台机器都以 runner 账户 `docker login` 过，Docker Hub 上四个仓库都是 Private
+- [ ] 两个 runner 都以非 root 专用账户运行，**label**（不只是 name）分别为
+      `superfive-ubuntu` / `superfive-pi5`
 - [ ] `main` 分支保护规则已开启（仓库目前还没有 `main`）
 - [ ] `.env` 已就位、权限 600，且**不在** runner 工作区里
 - [ ] `.12` 上 `docker run --rm --gpus all ubuntu nvidia-smi` 能出卡

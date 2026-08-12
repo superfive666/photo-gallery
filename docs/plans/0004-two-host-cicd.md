@@ -1,96 +1,105 @@
-# 0004 — 构建机与部署机分离（.15 构建 / .12 运行）
+# 0004 — 自建 runner 落地（两台机器，.12 就地构建并部署）
 
 ## 背景
 
-原先的 `deploy.yml` 假设「runner 就是部署目标」：在同一台机器上 `docker compose build`
-然后 `up -d`。实际有两台内网机器：
+原先的 `deploy.yml` 假设「runner 就是部署目标」，且假设只有一台机器。实际有两台：
 
-| 机器 | 硬件 | 角色 |
-| --- | --- | --- |
-| `192.168.0.15` | Ubuntu，无 GPU | 构建镜像、推私有 registry |
-| `192.168.0.12` | Ubuntu，有 NVIDIA GPU | 跑生产服务、存 Postgres 数据卷 |
-
-在这个拓扑下原 workflow 跑不通 —— 它会在没有 GPU 的机器上把服务起起来。
+| 机器 | 硬件 | Runner label | 角色 |
+| --- | --- | --- | --- |
+| `192.168.0.12` | x86_64、NVIDIA GPU | `superfive-ubuntu` | 构建 + 部署 + 定时建库 |
+| `192.168.0.15` | Raspberry Pi 5、arm64 | `superfive-pi5` | 已注册，暂无分配 job |
 
 ## 目标
 
-1. `.15` 只负责构建与推镜像，**永不接触生产数据库和 `.env`**。
-2. `.12` 只负责 `pull → migrate → up -d → 健康检查`，**永不构建**。
-3. 部署产物可寻址、可回滚：镜像用 `sha-<short>` tag，回滚就是换 tag 重启。
+1. 两台机器都注册成 self-hosted runner，用**唯一 label**（机器名）精确定位。
+2. 部署全程在 `.12` 上：就地 `build → migrate → up -d → 健康检查`，不引入镜像仓库。
+3. 版本可回滚：镜像打 `sha-<short>` tag，回滚 = 换 tag 重新 `up`。
 4. 一份文档能让人从裸 Ubuntu 走到上线（`docs/deployment.md`）。
 
 ## 范围
 
 - 新增 `docker-compose.gpu.yml`（GPU 设备声明，只在 `.12` 上叠加）。
-- `docker-compose.yml` 的四个可构建服务补 `image:` 字段 —— 没有它就没法 pull。
-  用 `${IMAGE_PREFIX}-<svc>:${IMAGE_TAG}` 的形式，一个变量就能在
-  「本地 / Docker Hub / GHCR / 内网 registry」之间切换。
-- `deploy.yml` 拆成 `build`（`zrc-ci` = .15）→ `deploy`（`zrc-prod` = .12）两个 job。
+- `docker-compose.yml` 四个可构建服务显式声明 `image`，形式
+  `${IMAGE_PREFIX}-<svc>:${IMAGE_TAG}` —— 用默认名（都叫 `:latest`）就没有回滚能力。
+- `deploy.yml` 单 job，跑在 `superfive-ubuntu` 上。
 - 生产状态目录固定为 `/opt/photo-gallery`，`.env` 放那里。
 - `web/nginx.conf` 加 `real_ip` —— 前面多了一层宿主机反向代理之后必须的修正。
-- `docs/deployment.md`：两台机器的逐步 runbook。
+- `docs/deployment.md`：runner 安装 + 生产机配置的逐步 runbook。
 
 ## 非范围
 
 - 不做 staging 环境。
 - 不做蓝绿/多副本。单机社团项目，滚动重启 + 回滚 tag 够用。
 - 不把 CI（lint/test）搬到自建 runner 上。见下面的「决策」。
+- 不引入镜像仓库。见下面的「决策」。
 - 不引入 Kubernetes、Swarm、Ansible。
 
 ## 决策与理由
 
-### 镜像怎么从 .15 到 .12：Docker Hub 私有仓库
+### 镜像怎么传：不传，就在部署的机器上构建
 
-`.15` push，`.12` pull，中间过一趟公网。
+演进过三版，记录下来免得以后重复讨论：
 
-我原本提的是「`.15` 上跑内网 `registry:2`」，理由是 GPU 版 embedding 镜像
-（onnxruntime-gpu + CUDA 运行时 + 300MB 模型权重）是 GB 级的，家宽上行是这条链路上
-最慢的一环。**这个代价现在是明确接受的**，换来的是不用自己运维 registry、
-不用给两台机器开 `insecure-registries`、镜像有一份异地副本。
+1. **`.15` 上跑内网 `registry:2`** —— GPU 版 embedding 镜像（onnxruntime-gpu +
+   CUDA 运行时 + 300MB 模型权重）是 GB 级的，走内网千兆最快。代价：多一套要运维的
+   服务，两台机器都得加 `insecure-registries`。
+2. **Docker Hub 私有仓库** —— 不用自运维，镜像有异地副本。代价：GB 级镜像要经家宽
+   上传再下载；而且 Docker Hub 仓库名只有两级，四个服务 = 四个私有仓库，
+   **免费版只含 1 个**。
+3. **不要仓库，直接在 `.12` 上构建。** ← 采用
 
-实际影响比第一直觉小：Docker Hub 也是按层去重的，那些大层在依赖层里，
-改业务代码时只传最后一个小层。疼的是**第一次** push 和第一次 pull。
+第 3 版是最省的：构建产物就在要运行它的 docker daemon 里，零传输、零凭据、零额度。
+既然唯一的部署目标只有一台机器，中间那一跳本来就不产生价值。
 
-镜像命名要注意：Docker Hub 的仓库名只有 `<用户>/<仓库>` 两级，不能像 GHCR 那样
-`ghcr.io/<用户>/<项目>/<服务>` 三级。所以 `IMAGE_PREFIX` 是**仓库名前缀**而不是命名空间：
-`superfive666/photo-gallery-api`。四个服务 = 四个仓库，而
-**Docker Hub 免费版只含 1 个私有仓库** —— 这一条写进了 `deployment.md` 第 0 节，
-需要 Pro，或者退回内网 registry / 合并成一个仓库用 tag 前缀区分。
+代价，写清楚：
 
-不用 `docker save | ssh docker load`：每次都要传全量，且要维护跨机 SSH 密钥。
+- 构建的 CPU / 磁盘 IO 落在 GPU 机上，会和在线检索抢资源。靠每次部署后
+  `docker image prune --filter until=168h` 控制磁盘。
+- **回滚只依赖本机镜像。** 没有仓库可拉，那个一周的保留窗口就是回滚能力的唯一来源。
+  机器换盘或窗口过期就只能重新构建部署。
+- 没有镜像的异地副本。
 
-凭据不进 GitHub Secrets：两台机器各自 `docker login` 一次（`.15` 读写 token、
-`.12` 只读 token），凭据不经过 CI 平台。给生产机只读 token 是因为改镜像等于
-下次部署时在生产机上执行任意代码。
+`IMAGE_PREFIX` 变量留着：以后要引入仓库（GHCR / Docker Hub / 内网 registry），
+改这一个值就行，compose 与 workflow 都不用动。
 
-### 部署怎么触发：在 .12 上再装一个 runner，不用 SSH
+### 部署怎么触发：`.12` 自己的 runner，不用 SSH
 
-`.12` 装第二个 runner，标签 `zrc-prod`；`.15` 的标签是 `zrc-ci`。
-两个 job 用标签精确选中，GitHub 负责调度和日志。
+不用「从别的机器 SSH 登到 `.12` 执行」：那需要在 GitHub Secrets 里放一把能登生产机的
+私钥，等于把生产机的入口交给 CI 平台。让 `.12` 自己跑 runner，GitHub 只负责调度和日志。
 
-不用「`.15` 通过 SSH 登到 `.12` 执行」：那需要在 GitHub secrets 里放一把能登生产机的
-私钥，等于把生产机的入口交给 CI 平台，与「`.15` 永不接触生产」的目标冲突。
+这个拓扑下 **GitHub Secrets 一个都不需要**。
+
+### 用机器名做 label，`runs-on` 里不写架构
+
+`runs-on` 匹配的是 runner 的 **label** 而不是 name，且标签之间是「与」的关系。
+两台机器架构不同（`.15` 是 arm64 的 Pi 5），所以 `runs-on` 写
+`[self-hosted, linux, superfive-ubuntu]` —— 不带 `x64`。
+
+把架构写进 `runs-on` 的后果是「选错机器时永远 Queued」，不报错、不超时，
+是最难定位的一类故障。用一个唯一 label 定位最直接。
 
 ### CI（lint/test）留在 GitHub 托管 runner 上
 
-`.15` 上的 runner 只执行本仓库部署分支上的构建步骤。lint/test 会跑测试代码、
-装 npm 依赖 —— 那是需要隔离的东西，继续跑在托管 runner 上（CLAUDE.md 约束 9）。
-`.15` 的价值是「构建不占 GPU 机的磁盘和 CPU」和「拿住那道隔离边界」，不是省 CI 分钟数。
+自建 runner 上只执行本仓库部署分支上的构建/部署步骤。lint/test 会跑测试代码、装 npm
+依赖 —— 那是需要隔离的东西（CLAUDE.md 约束 9），继续跑在托管 runner 上。
+
+`.15` 也不适合接这个活：`insightface` 没有 arm64 预编译 wheel，大概率要从源码编译。
 
 ### embedding 镜像只构建 GPU 变体
 
-唯一的部署目标有 GPU，所以 CI 构建时固定 `EMBEDDING_GPU=true`。
+唯一的部署目标有 GPU，所以部署时固定 `EMBEDDING_GPU=true`。
 `onnxruntime-gpu` 在没有 CUDA 的机器上 `import` 不会炸，providers 列表里带
 `CPUExecutionProvider` 兜底（见 `embedding/app/model.py`），所以这个镜像在 CPU 机器上
 仍能跑，只是慢。本地开发不受影响：`docker compose build` 默认还是 CPU 变体。
 
 ## 验收标准
 
-- [ ] Docker Hub 上四个仓库都是 **Private**（`docker push` 自动建出来的是 public）。
-- [ ] `.15` 上 build + push 成功，Docker Hub 上四个仓库都有 `sha-<short>` 与 `latest`。
-- [ ] `.12` 上 `docker compose pull` 拿到同一批镜像，`docker compose ps` 四个服务 healthy。
-- [ ] `curl -s localhost:8000/healthz` 在 embedding 容器里返回 `gpu: true` 且
-      `batch_supported: true`。
+- [ ] 两个 runner 在 Settings → Runners 里都是 **Idle**，label 分别为
+      `superfive-ubuntu` / `superfive-pi5`（不只是 name）。
+- [ ] `.12` 上手动 `docker compose --env-file /opt/photo-gallery/.env --profile tools build`
+      能过。
+- [ ] `docker compose ps` 四个服务 healthy。
+- [ ] embedding 容器里打 `/healthz` 返回 `gpu: true` 且 `batch_supported: true`。
 - [ ] `workflow_dispatch` 手动触发 deploy，全流程绿，`/opt/photo-gallery/.deployed-tag`
       记下了新 tag。
 - [ ] 故意部署一个起不来的版本，健康检查失败后自动回滚到上一 tag，服务可用。
@@ -100,14 +109,15 @@
 
 1. **`actions/checkout` 会 `git clean -ffdx`，连 gitignore 的文件一起删。**
    原设计把 `.env` 放在 runner 工作区里，第二次部署就会被清掉，服务带着默认密码重启。
-   这次把生产状态挪到工作区之外的 `/opt/photo-gallery`，工作区只用于取 compose 文件。
-2. **runner 账户在 `docker` 组里，等价于 root。** 这正是「`.12` 的 runner 只跑我们自己的
+   这次把生产状态挪到工作区之外的 `/opt/photo-gallery`：构建在工作区里做，
+   但 `--env-file` 指向生产 `.env`，运行时的 compose 命令都 `cd` 到那个目录。
+2. **runner 账户在 `docker` 组里，等价于 root。** 这正是「runner 只跑我们自己的
    部署步骤、不跑测试代码」这条纪律的原因。
 3. **多了一层宿主机反向代理，`X-Forwarded-For` 会退化。** 容器里看到的 `$remote_addr`
    是 docker 网桥地址，全部用户会被限流器当成同一个 IP。`nginx.conf` 里用 `real_ip`
    修正，但这依赖「8080 只绑 127.0.0.1」—— 一旦把 8080 暴露到公网，客户端就能伪造
    `X-Forwarded-For` 绕过限流。`.env` 里的 `WEB_BIND` 是这条约束的开关。
-4. **registry 磁盘只增不减。** 删 tag 之后要手动 garbage-collect，否则家用机磁盘会被
-   历史层吃满。运维一节里有 cron。
+4. **`docker system prune -a` 会毁掉回滚能力。** 它会删掉「没有容器在用」的镜像，
+   也就是上一个版本。运维文档里只允许 `docker image prune`（带 `until` 过滤）。
 5. **迁移在新镜像启动之前跑**，这个顺序不能改（理由见 `docs/cicd.md`）。
    回滚只回滚镜像、不回滚数据库，前提是 DDL 始终只做向后兼容的追加（CLAUDE.md 约束 6）。

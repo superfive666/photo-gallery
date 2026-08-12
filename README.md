@@ -94,11 +94,14 @@ CI 用 `uv sync --frozen`：改了依赖但忘记提交 `uv.lock` 会直接失�
 
 ## 部署
 
-两台内网机器：一台无 GPU 只负责构建镜像并推 Docker Hub 私有仓库，一台有 GPU 只负责
-`pull → 迁移 → 滚动重启`。构建机不接触 `.env` 与数据库，生产机不执行测试代码。
+两台内网机器都注册成 GitHub self-hosted runner，用机器名做 label 精确定位。
+部署全程在带 GPU 的那台上：就地 `build → 迁移 → 滚动重启 → 健康检查`，
+**不引入镜像仓库** —— 构建产物直接留在要运行它的 docker 里。
+版本靠 `sha-<short>` tag 区分，回滚就是换个 tag 重新 `up`。
 
-从裸 Ubuntu 到上线的逐步 runbook 见 [`docs/deployment.md`](docs/deployment.md)；
-分支模型与 workflow 布局见 [`docs/cicd.md`](docs/cicd.md)。
+从裸 Ubuntu 到上线的逐步 runbook（含 runner 安装）见
+[`docs/deployment.md`](docs/deployment.md)；分支模型与 workflow 布局见
+[`docs/cicd.md`](docs/cicd.md)。
 
 ```bash
 # 生产机上叠加 GPU 层（写在 .env 里，这样手敲命令也一致）

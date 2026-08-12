@@ -28,7 +28,7 @@ concurrency:
 
 jobs:
   ingest:
-    runs-on: [self-hosted, linux, x64, zrc-prod]
+    runs-on: [self-hosted, linux, superfive-ubuntu]
     if: github.repository == 'superfive666/photo-gallery'
     # 大相册全量重跑可能要几小时
     timeout-minutes: 480
@@ -41,8 +41,8 @@ jobs:
       # checkout 只为了给 upload-artifact 一个存在的工作区。
       - uses: actions/checkout@v4
 
-      # 用**已部署**的 tag，不用 latest：latest 可能已经指向一个还没上线的构建，
-      # 那会让定时任务偷偷跑上一个未经部署验证的版本。
+      # 用**已部署**的那个 tag：镜像名里带 sha，不显式指定的话 compose 会去找
+      # :dev，那个 tag 在生产机上不存在。
       - name: 取当前已部署的镜像 tag
         run: |
           set -eu

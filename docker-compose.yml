@@ -1,17 +1,16 @@
 # Dockerfile 全部在 docker/ 下，见 docker/README.md
 name: photo-gallery
 
-# 四个可构建服务都同时声明 build 与 image：
-#   - 本地开发：`docker compose build` 构建出 photo-gallery-<svc>:dev，不推送
-#   - 构建机(.15)：设 IMAGE_PREFIX/IMAGE_TAG 后 build + push 到 Docker Hub 私有仓库
-#   - 生产机(.12)：只 `docker compose pull`，从不构建
-# 没有 image 字段就没法 pull —— 这是两台机器分离的前提。见 docs/deployment.md。
+# 四个可构建服务都显式声明 image，而不是让 compose 用默认名：
+#   本地开发   photo-gallery-api:dev
+#   生产部署   photo-gallery-api:sha-abc1234
 #
-# IMAGE_PREFIX 是「仓库名前缀」而不是「命名空间」：Docker Hub 的仓库名只有
-# <用户>/<仓库> 两级，不能再用斜杠分层。所以四个服务是四个仓库：
-#   本地        photo-gallery-api:dev
-#   Docker Hub  superfive666/photo-gallery-api:sha-abc1234
-# 换 registry（GHCR、内网）只改这一个变量，workflow 不用动。
+# 没有镜像仓库 —— 构建就在部署的那台机器上做（见 docs/deployment.md）。
+# 显式 tag 的作用是**回滚**：上一个版本的镜像还在本机，换个 IMAGE_TAG 重新 up 即可。
+# 用 compose 的默认名（都叫 :latest）就没有这个能力。
+#
+# 以后想引入仓库，只改 IMAGE_PREFIX 一个变量（GHCR 三级路径、Docker Hub 两级
+# 加 `-<svc>` 后缀都能拼出来），workflow 不用动。
 
 services:
   db:
