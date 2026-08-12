@@ -1,8 +1,14 @@
 name: CI
 
 # ⚠️ 这个 workflow 必须跑在 GitHub 托管 runner 上。
-# 自建 runner 只用于部署（deploy.yml / ingest.yml），绝不用于 PR 的 CI ——
+# 自建 runner 只用于构建与部署（deploy.yml / ingest.yml），绝不用于 PR 的 CI ——
 # 否则 fork 提的 PR 就能在自建机器上执行任意代码。见 docs/cicd.md。
+#
+# 换句话说：自建 runner 上只执行部署分支上的构建与部署步骤，不跑测试代码、
+# 不装 npm 依赖。「家里的机器上有 runner」不等于「什么都可以在上面跑」。
+#
+# 另外 .15 是 arm64 的 Pi 5，insightface 没有 arm64 预编译 wheel，
+# 这个 job 搬过去大概率要从源码编译 —— 不值当。
 on:
   pull_request:
   push:
@@ -33,35 +39,33 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgresql+asyncpg://gallery:test-password@localhost:5432/photo_gallery_test
-      PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/libs:${{ github.workspace }}/jobs
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      # uv 版本钉死，与 Dockerfile 里的一致 —— 它决定 uv.lock 的解读方式
+      - uses: astral-sh/setup-uv@v5
         with:
-          python-version: '3.11'
-          cache: pip
+          version: '0.8.17'
+          enable-cache: true
 
+      # --frozen：uv.lock 与 pyproject 不一致就直接失败。
+      # 这一步同时起到「有人改了依赖但忘记提交 uv.lock」的守卫作用。
       - name: 安装依赖
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r api/requirements.txt -r jobs/requirements.txt
-          pip install -e ./libs
-          pip install ruff mypy
+        run: uv sync --all-packages --frozen
 
       - name: ruff
         run: |
-          ruff check api jobs libs embedding
-          ruff format --check api jobs libs embedding
+          uv run ruff check api jobs libs embedding
+          uv run ruff format --check api jobs libs embedding
 
       - name: mypy
-        run: mypy api jobs libs embedding
+        run: uv run mypy api jobs libs embedding
 
       - name: 迁移能跑通
-        run: python -m jobs migrate
+        run: uv run python -m jobs migrate
 
       - name: pytest
-        run: pytest -q
+        run: uv run pytest -q
 
   web:
     runs-on: ubuntu-latest

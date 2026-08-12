@@ -1,0 +1,35 @@
+[project]
+name = "embedding"
+version = "0.1.0"
+description = "人脸检测 + embedding 推理服务（InsightFace buffalo_l）"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    # 只用到 logging 与 vector，不碰 DB —— 但共用同一份归一化实现是硬要求
+    "gallery-core",
+    "fastapi>=0.115.6",
+    "uvicorn[standard]>=0.34",
+    "python-multipart>=0.0.20",
+    "insightface>=1.0.1",
+    # insightface 本身也硬依赖 onnxruntime，这里显式再写一遍是为了让版本范围可见、
+    # 可控，而不是取决于 insightface 的元数据。
+    "onnxruntime>=1.20",
+    # 见根 pyproject 的 override-dependencies：insightface 带的是非 headless 版，已摘掉
+    "opencv-python-headless>=4.10",
+    "pillow>=11.1",
+]
+
+# ⚠️ GPU 推理不在这份锁文件里，这是**有意的**。
+#
+# onnxruntime 与 onnxruntime-gpu 提供同一个 `onnxruntime` 模块，装两个会互相覆盖；
+# 而 insightface 硬依赖前者，没法用互斥 extra 干净地二选一（uv 的 override 是全局
+# 按包名生效的，摘掉传递依赖的同时也会摘掉我们自己声明的那条）。
+#
+# 所以：CPU 路径完整入锁（CI 与默认部署走这条），GPU 由 docker/Dockerfile.embedding
+# 在 sync 之后显式替换，并在那里写明它步出了锁文件。
+
+[tool.uv]
+# 不构建成包：代码通过源码目录导入（见根 pyproject 的说明）
+package = false
+
+[tool.uv.sources]
+gallery-core = { workspace = true }

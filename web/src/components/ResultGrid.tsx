@@ -18,9 +18,9 @@ export function ResultGrid({
   return (
     <div className="space-y-8">
       {groups.map((group) => (
-        <section key={group.albumId} className="space-y-3">
+        <section key={group.album} className="space-y-3">
           <header className="flex items-baseline justify-between gap-3">
-            <h2 className="truncate text-base font-medium">{group.albumName}</h2>
+            <h2 className="truncate text-base font-medium">{group.album}</h2>
             <span className="text-ink-600 shrink-0 text-xs">{group.items.length} 张</span>
           </header>
 
@@ -35,7 +35,7 @@ export function ResultGrid({
                 {match.thumb_url ? (
                   <img
                     src={match.thumb_url}
-                    alt={match.filename}
+                    alt={`${group.album} 的照片`}
                     // 懒加载 + 固定宽高比，避免长列表一次性发起几百个请求
                     loading="lazy"
                     decoding="async"
@@ -56,8 +56,7 @@ export function ResultGrid({
 }
 
 interface AlbumGroup {
-  albumId: string
-  albumName: string
+  album: string
   // 保留在完整结果数组中的下标，供 lightbox 跨相册前后翻页
   items: { match: Match; index: number }[]
 }
@@ -65,10 +64,10 @@ interface AlbumGroup {
 function groupByAlbum(matches: Match[]): AlbumGroup[] {
   const byAlbum = new Map<string, AlbumGroup>()
   matches.forEach((match, index) => {
-    let group = byAlbum.get(match.album_id)
+    let group = byAlbum.get(match.album)
     if (!group) {
-      group = { albumId: match.album_id, albumName: match.album_name, items: [] }
-      byAlbum.set(match.album_id, group)
+      group = { album: match.album, items: [] }
+      byAlbum.set(match.album, group)
     }
     group.items.push({ match, index })
   })

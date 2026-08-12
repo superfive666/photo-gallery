@@ -2,21 +2,33 @@
 name = "gallery-core"
 version = "0.1.0"
 description = "api 与 jobs 共享的核心代码：DB 模型、embedding 客户端、配置、向量工具"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.12"
+# 基础依赖 = gallery_core/__init__.py 那条 import 链真正需要的东西：
+# config(pydantic-settings) / embedding_client(httpx) / vector(numpy) / logging(structlog)。
 dependencies = [
-    "sqlalchemy[asyncio]>=2.0.30",
-    "asyncpg>=0.29",
-    "pgvector>=0.3.0",
-    "pydantic>=2.7",
-    "pydantic-settings>=2.3",
-    "httpx>=0.27",
-    "numpy>=1.26",
-    "structlog>=24.1",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "httpx>=0.28",
+    # numpy 2.x 与 insightface / onnxruntime 的兼容性没有验证过，而三个服务共用同一份
+    # uv.lock，所以整体钉在 1.x。
+    "numpy>=1.26,<2",
+    "structlog>=24.4",
 ]
 
-[build-system]
-requires = ["setuptools>=69"]
-build-backend = "setuptools.build_meta"
+# DB 栈单独成 extra。embedding 服务只用 logging 与 vector，不碰数据库 ——
+# 不拆的话 sqlalchemy / asyncpg / pgvector / greenlet 会白白进 embedding 镜像。
+# models.py 与 db.py 只被 api / jobs 导入，__init__.py 不 import 它们，所以拆得开。
+[project.optional-dependencies]
+db = [
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30",
+    "pgvector>=0.3.6",
+]
 
-[tool.setuptools.packages.find]
-include = ["gallery_core*"]
+# 四个成员里只有这一个是真正会被构建安装的包。
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["gallery_core"]

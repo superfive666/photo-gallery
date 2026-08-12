@@ -1,0 +1,25 @@
+# GPU 叠加层。只在有 NVIDIA 卡的机器上启用（生产机 192.168.0.12）。
+#
+# 用法：在该机器的 .env 里写
+#     COMPOSE_FILE=docker-compose.yml:docker-compose.gpu.yml
+# compose 会自动读项目目录下 .env 里的 COMPOSE_FILE，所以 `docker compose ...`
+# 和 `make up` 都不需要额外加 -f。
+#
+# 前置条件（见 docs/deployment.md）：
+#   1. 宿主机装好 NVIDIA 驱动，`nvidia-smi` 能出卡；
+#   2. 装好 nvidia-container-toolkit 并 `nvidia-ctk runtime configure --runtime=docker`；
+#   3. 镜像是用 EMBEDDING_GPU=true 构建的；
+#   4. .env 里 EMBEDDING_USE_GPU=true（决定 providers 与 ctx_id）。
+#
+# 少了第 3/4 条不会报错，只会静默退回 CPU 推理 —— 起来后用
+# `docker compose exec embedding python -c "..."` 打 /healthz 确认 gpu: true。
+
+services:
+  embedding:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

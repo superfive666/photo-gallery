@@ -2,23 +2,30 @@ const BASE = import.meta.env.VITE_API_BASE_URL ?? '/api'
 
 export interface Match {
   photo_id: string
-  album_id: string
-  album_name: string
-  filename: string
-  taken_at: string | null
+  // album slug，形如 '2026-08-10'，与源站 /album/<slug> 一致
+  album: string
   score: number
   thumb_url: string | null
   original_url: string
+}
+
+export interface Album {
+  album: string
+  photo_count: number
+  face_count: number
 }
 
 export type SearchStatus = 'ok' | 'no_face' | 'no_match'
 
 export interface SearchResponse {
   matches: Match[]
-  faces_detected: number
+  // 从几张自拍里取到了可用的人脸（每张最多取一张 —— 最明显的那张）
+  faces_used: number
   status: SearchStatus
   message: string | null
   latency_ms: number
+  // 服务端确认自拍已销毁。恒为 true，但要显式展示给用户而不是让他猜。
+  selfie_discarded: boolean
 }
 
 export class ApiError extends Error {
@@ -66,9 +73,17 @@ export async function logout(): Promise<void> {
   await fetch(`${BASE}/session/logout`, { method: 'POST', credentials: 'same-origin' })
 }
 
-export async function search(files: File[]): Promise<SearchResponse> {
+export async function listAlbums(): Promise<Album[]> {
+  const response = await fetch(`${BASE}/albums`, { credentials: 'same-origin' })
+  if (!response.ok) await parseError(response)
+  return (await response.json()) as Album[]
+}
+
+export async function search(files: File[], album?: string): Promise<SearchResponse> {
   const form = new FormData()
   for (const file of files) form.append('selfies', file, file.name)
+  // 带上 album 会让后端走分区裁剪，只在那一个相册里检索
+  if (album) form.append('album', album)
 
   const response = await fetch(`${BASE}/search`, {
     method: 'POST',

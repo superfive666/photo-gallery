@@ -12,6 +12,9 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+# ⚠️ uv.lock 必须提交 —— 它是「镜像里装的到底是哪些版本」的唯一凭据。
+# uv 的缓存不用提交：
+.uv-cache/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/

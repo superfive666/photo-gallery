@@ -22,11 +22,15 @@ export function SelfieUploader({
   onChange,
   onSubmit,
   pending,
+  albumFilter,
 }: {
   items: SelfieItem[]
   onChange: (items: SelfieItem[]) => void
   onSubmit: () => void
   pending: boolean
+  // 相册筛选器由上层注入，放在「开始检索」之前 —— 它是可选的收窄手段，
+  // 不该抢在上传之前挡住主流程。
+  albumFilter?: React.ReactNode
 }) {
   const cameraInput = useRef<HTMLInputElement>(null)
   const libraryInput = useRef<HTMLInputElement>(null)
@@ -133,6 +137,8 @@ export function SelfieUploader({
           再加一两张不同角度的自拍，能明显提高找到照片的概率。
         </p>
       )}
+
+      {albumFilter}
 
       <button
         type="button"

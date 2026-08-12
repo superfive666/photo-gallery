@@ -46,10 +46,9 @@ export function Lightbox({
     >
       <header className="flex items-center justify-between gap-3 px-4 py-3">
         <div className="min-w-0">
-          <p className="truncate text-sm font-medium">{match.album_name}</p>
+          <p className="truncate text-sm font-medium">{match.album}</p>
           <p className="text-ink-600 truncate text-xs">
-            {match.filename}
-            {match.taken_at ? ` · ${formatDate(match.taken_at)}` : ''}
+            第 {index + 1} / {matches.length} 张
           </p>
         </div>
         <button
@@ -66,7 +65,7 @@ export function Lightbox({
         {match.thumb_url && (
           <img
             src={match.thumb_url}
-            alt={match.filename}
+            alt={`${match.album} 的照片`}
             className="max-h-full max-w-full rounded-xl object-contain"
           />
         )}
@@ -102,14 +101,4 @@ export function Lightbox({
       </footer>
     </div>
   )
-}
-
-function formatDate(iso: string): string {
-  const date = new Date(iso)
-  if (Number.isNaN(date.getTime())) return ''
-  return date.toLocaleDateString('zh-Hans-SG', {
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-  })
 }

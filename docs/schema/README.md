@@ -9,7 +9,7 @@ Postgres 16 + [pgvector](https://github.com/pgvector/pgvector) ≥ 0.8。
   schema 静默分叉。
 - 每个文件包在 `BEGIN; ... COMMIT;` 里，末尾写入 `schema_migrations`。
 - DDL 尽量用 `IF NOT EXISTS`，使重复执行无害。
-- 执行：`make migrate`（`jobs/migrate.py` 按文件名排序，跳过 `schema_migrations` 中已有的版本）。
+- 执行：`make migrate`。
 
 ### 破坏性变更要拆两步
 
@@ -24,55 +24,96 @@ Postgres 16 + [pgvector](https://github.com/pgvector/pgvector) ≥ 0.8。
 | 表 | 作用 | 关键点 |
 | --- | --- | --- |
 | `schema_migrations` | 迁移版本 | — |
-| `album` | 源站相册 | `visibility != 'public'` 不进检索库 |
-| `photo` | 源站资产，一张一行 | `source_asset_id` 唯一 → 幂等；`thumb_webp BYTEA` 走 TOAST；软删除 |
-| `face` | 一张脸一行 | `VECTOR(512)` + HNSW cosine；带 `model_name/version/dim` 溯源 |
-| `person` | 聚类簇 | `centroid` 为簇内均值再归一化；两段式检索的第一段 |
-| `block_list` | opt-out | 按 person 或 photo；检索在 SQL 层过滤 |
-| `source_sync_state` | 同步游标 | 支撑增量 |
+| `photo` | 一张照片/视频一行 | `album` 只属于这里；`photo_url` 唯一 → 幂等；`thumbnail BYTEA` 走 TOAST；软删除 |
+| `face` | **向量主表**，一张脸一行 | 普通表不分区；`embedding` 上 HNSW cosine 索引 |
+| `block_list` | opt-out | 按 face 或 photo；检索在 SQL 层过滤 |
+| `album_sync_state` | 同步进度 | 按 album slug |
 | `job_run` | 离线任务记录 | 排查召回率变差的第一现场 |
 | `search_audit` | 检索留痕 | **只有计数与耗时**，无图片无向量 |
 
-## 常用查询
+只有两张主表：
 
-**两段式检索的第一段（簇心匹配）** —— `:q` 是归一化后的查询向量：
-
-```sql
-SELECT p.id, 1 - (p.centroid <=> :q) AS similarity, p.face_count
-FROM person p
-WHERE NOT EXISTS (SELECT 1 FROM block_list b WHERE b.person_id = p.id)
-  AND 1 - (p.centroid <=> :q) >= :person_threshold
-ORDER BY p.centroid <=> :q
-LIMIT 10;
+```
+photo  ──1:N──▶  face
+  id (uuidv7)      id (uuidv7)
+  album            photo_id  ──FK──▶ photo.id
+  photo_url        embedding vector(512)
+  thumbnail
 ```
 
-`<=>` 是 cosine 距离；因为向量已 L2 归一化，`1 - distance` 即 cosine 相似度。
+**`album` 只放在 `photo` 上。** 一张照片属于哪个相册是照片自己的属性，与它上面有几张脸
+无关；`face` 通过 `photo_id` 外键间接得到 album，不冗余存第二份。
 
-**取簇内全部照片并按最佳命中打分**：
+**为什么 photo 和 face 必须分表**：一张十人合影产生 1 条 photo + 10 条 face。
+把 embedding 挂在 photo 上是从一开始就走不通的。
+
+**没有 person 表，也不做聚类。** 查询完全是实时的：上传自拍 → 取最明显的一张脸 →
+对 face 做 KNN。代价是侧脸/背光照片的召回率低于「先聚类再按人取图」的方案，
+取舍记录在 [`../plans/0003-drop-partition-and-person.md`](../plans/0003-drop-partition-and-person.md)。
+
+## 主键用 UUIDv7
+
+`gen_random_uuid()`（v4）完全随机，插入位置在 B-tree 里到处跳，批量入库时页分裂严重、
+索引膨胀。v7 前 48 位是 Unix 毫秒时间戳，插入始终落在索引右端 —— 离线建库正是
+「一次灌很多」的场景。
+
+两个实现，用途不同：
+
+| 实现 | 用途 | 保证 |
+| --- | --- | --- |
+| SQL `uuid_generate_v7()`（列默认值） | 不指定 id 的插入 | 毫秒粒度有序 |
+| Python `gallery_core.uuid7()` | 批量入库时客户端预生成 | **严格单调**（带毫秒内计数器） |
+
+PostgreSQL 18 起有内置 `uuidv7()`。升级后可以新增一个迁移把 DEFAULT 换成原生函数
+（不要改 `001_init.sql`）。
+
+## 向量检索的写法
+
+pgvector 的 HNSW 索引**只在 `ORDER BY embedding <=> q LIMIT n` 这个形式下会被用到**。
+直接写 `WHERE 1 - (embedding <=> q) >= 阈值` 用不上索引，会退化成全表顺序扫描。
+
+所以检索分两层：内层取候选（走索引），外层过滤。
 
 ```sql
-SELECT ph.id, ph.album_id, ph.taken_at,
-       MAX(1 - (f.embedding <=> :q)) AS score
-FROM face f
-JOIN photo ph ON ph.id = f.photo_id
-WHERE f.person_id = ANY(:person_ids)
+WITH candidate AS (
+    -- 必须保持 ORDER BY + LIMIT，否则用不上 HNSW
+    SELECT f.id AS face_id, f.photo_id,
+           1 - (f.embedding <=> CAST(:q AS vector)) AS sim
+    FROM face f
+    ORDER BY f.embedding <=> CAST(:q AS vector)
+    LIMIT :candidates
+)
+SELECT ph.id, ph.album, ph.photo_url, MAX(c.sim) AS score
+FROM candidate c
+JOIN photo ph ON ph.id = c.photo_id
+WHERE c.sim >= :threshold
   AND ph.deleted_at IS NULL
+  AND (:album IS NULL OR ph.album = :album)
+  AND NOT EXISTS (SELECT 1 FROM block_list b WHERE b.face_id  = c.face_id)
   AND NOT EXISTS (SELECT 1 FROM block_list b WHERE b.photo_id = ph.id)
-GROUP BY ph.id, ph.album_id, ph.taken_at
+GROUP BY ph.id, ph.album, ph.photo_url
 ORDER BY score DESC
 LIMIT :limit;
 ```
 
+`<=>` 是 cosine 距离；因为向量已 L2 归一化，`1 - distance` 即 cosine 相似度。
+
+⚠️ **`:candidates`（`SEARCH_CANDIDATES`，默认 500）是召回上限。** 一个人在库里的照片数
+超过它就会少返结果。相册过滤发生在取候选之后，所以带 `album` 条件时代码会自动把候选数
+放大 4 倍 —— 否则在一个只占全库 5% 的相册里筛选，500 个候选里可能只剩二十几个属于它。
+
+如果日后出现「某人照片特别多，结果被截断」，调 `SEARCH_CANDIDATES` 而不是调阈值。
+
 ## 索引调优
 
-HNSW 的查询召回由 `hnsw.ef_search` 控制（默认 40）。召回不足时在 session 里调高：
+HNSW 的查询召回由 `hnsw.ef_search` 控制（默认 40）。召回不足时在事务里调高：
 
 ```sql
 SET LOCAL hnsw.ef_search = 100;
 ```
 
-代价是延迟上升。在本项目的数据量级（十万级向量）下，设到 100~200 仍是毫秒级，
-值得为召回率买单。具体取值由评估集决定，见 [`../evaluation.md`](../evaluation.md)。
+必须用 `SET LOCAL`（事务级）而不是 `SET` —— 后者会污染连接池里的这条连接，
+影响之后复用它的所有请求。具体取值由评估集决定，见 [`../evaluation.md`](../evaluation.md)。
 
 ## 容量估算
 
@@ -81,7 +122,8 @@ SET LOCAL hnsw.ef_search = 100;
 | `face` 行数 | ~15 万（平均 3 张脸/图） |
 | embedding 原始体积 | 15 万 × 512 × 4B ≈ 300 MB |
 | HNSW 索引 | ~1.5× 向量体积 ≈ 450 MB |
-| `thumb_webp` | 5 万 × ~12KB ≈ 600 MB（TOAST 表） |
+| `thumbnail` | 5 万 × ~12KB ≈ 600 MB（TOAST 表） |
 | 合计 | ~1.5 GB |
 
-结论：单机 Postgres 完全够用，不需要引入独立向量数据库。
+结论：单机 Postgres 完全够用。十万级向量的 KNN 是毫秒级，既不需要独立向量数据库，
+也不需要分区。

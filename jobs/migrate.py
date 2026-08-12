@@ -63,11 +63,16 @@ async def run(engine: AsyncEngine, schema_dir: Path) -> list[str]:
             continue
         sql = path.read_text(encoding="utf-8")
         log.info("migration_applying", version=version)
-        # 每个文件自带 BEGIN/COMMIT，所以用 exec_driver_sql 走原始连接，
-        # 避免 SQLAlchemy 的隐式事务与文件内的显式事务嵌套冲突。
+        # 迁移文件是「多条语句 + 自带 BEGIN/COMMIT」的整体脚本，必须绕过 SQLAlchemy
+        # 直接用底层 asyncpg 连接执行：SQLAlchemy 的 execute/exec_driver_sql 都走
+        # asyncpg 的预处理语句协议，一次只接受一条命令（报 "cannot insert multiple
+        # commands into a prepared statement"）。asyncpg 自己的 execute() 在无参数
+        # 调用时走 simple query protocol —— 允许多条命令，事务也归脚本自己控制。
         async with engine.connect() as conn:
-            await conn.execution_options(isolation_level="AUTOCOMMIT")
-            await conn.exec_driver_sql(sql)
+            raw = await conn.get_raw_connection()
+            driver = raw.driver_connection
+            assert driver is not None  # 刚从池里拿出的连接必有底层驱动连接
+            await driver.execute(sql)
         executed.append(version)
         log.info("migration_applied", version=version)
 

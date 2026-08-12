@@ -77,6 +77,8 @@ def test_search_audit_stores_no_biometric_data() -> None:
         "id",
         "session_hash",
         "ip_hash",
+        # 本次检索限定了哪个相册。是使用行为而非生物特征，可以留。
+        "album_filter",
         "faces_detected",
         "candidate_count",
         "result_count",
