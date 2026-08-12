@@ -12,26 +12,11 @@ name: photo-gallery
 # 以后想引入仓库，只改 IMAGE_PREFIX 一个变量（GHCR 三级路径、Docker Hub 两级
 # 加 `-<svc>` 后缀都能拼出来），workflow 不用动。
 
-services:
-  db:
-    image: pgvector/pgvector:pg16
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    # 不映射到宿主机：数据库只应在 compose 内网可达。
-    # 本地调试临时需要时，用 `docker compose port db 5432` 或临时加 ports。
-    expose:
-      - "5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
+# ⚠️ 数据库不在这里。生产连的是宿主机上已有的 Postgres（DATABASE_URL 指向
+# host.docker.internal，见 docs/deployment.md）；本地开发想要容器化 pg 的话，
+# 叠加 docker-compose.localdb.yml（.env.example 的 COMPOSE_FILE 默认就带了它）。
 
+services:
   embedding:
     image: ${IMAGE_PREFIX:-photo-gallery}-embedding:${IMAGE_TAG:-dev}
     build:
@@ -76,11 +61,15 @@ services:
       dockerfile: docker/Dockerfile.api
     restart: unless-stopped
     env_file: .env
+    # 数据库在宿主机上，容器里用 host.docker.internal 访问它。
+    # host-gateway 由 docker 解析成宿主机在 docker0 网桥上的地址 ——
+    # 前提是宿主机 pg 的 listen_addresses 和 pg_hba 放行了 docker 网段，
+    # 见 docs/deployment.md 的「宿主机 Postgres」一节。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     expose:
       - "8000"
     depends_on:
-      db:
-        condition: service_healthy
       embedding:
         condition: service_healthy
     healthcheck:
@@ -117,9 +106,8 @@ services:
       dockerfile: docker/Dockerfile.jobs
     profiles: ["tools"]
     env_file: .env
-    depends_on:
-      db:
-        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       # 迁移脚本从这里读，改 SQL 无需重建镜像
       - ./docs/schema:/app/docs/schema:ro
@@ -127,6 +115,3 @@ services:
       - ${SOURCE_LOCAL_DIR:-./sample-albums}:/data/sample-albums:ro
       - ${EVAL_DIR:-./eval}:/data/eval:ro
       # 原图不落盘：批量推理把字节留在内存里，处理完即释放。所以这里没有原图缓存卷。
-
-volumes:
-  pgdata:

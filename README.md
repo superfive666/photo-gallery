@@ -66,7 +66,7 @@ Python 依赖用 [uv](https://docs.astral.sh/uv/) 管理（workspace + 单一 `u
 ```bash
 uv sync --all-packages             # 或 make install：按 uv.lock 装齐依赖
 cp .env.example .env               # 填入 INVITE_CODE_HASH / JWT_SECRET / AUDIT_HASH_SALT
-make up                            # 起 postgres + embedding + api + web
+make up                            # 起 embedding + api + web（本地默认还带容器化 pg）
 make migrate                       # 执行 docs/schema 下的 DDL
 make probe  ALBUM=2026-08-10       # 先探查源站页面结构，确认解析正确
 make ingest ALBUM=2026-08-10       # 批量拉取 + embedding + 落库
@@ -98,6 +98,10 @@ CI 用 `uv sync --frozen`：改了依赖但忘记提交 `uv.lock` 会直接失�
 部署全程在带 GPU 的那台上：就地 `build → 迁移 → 滚动重启 → 健康检查`，
 **不引入镜像仓库** —— 构建产物直接留在要运行它的 docker 里。
 版本靠 `sha-<short>` tag 区分，回滚就是换个 tag 重新 `up`。
+
+**数据库用生产机宿主机上已有的 Postgres**，不跑容器化 pg；容器经
+`host.docker.internal` 访问它。本地开发叠加 `docker-compose.localdb.yml`
+即可获得一个容器化 pg（`.env.example` 默认就是这个配置）。
 
 从裸 Ubuntu 到上线的逐步 runbook（含 runner 安装）见
 [`docs/deployment.md`](docs/deployment.md)；分支模型与 workflow 布局见

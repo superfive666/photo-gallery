@@ -191,7 +191,7 @@ runner 而不是 SSH 密钥、生产 `.env` 只存在于 `.12` 上 —— 没有
 - [ ] embedding 的 `/healthz` 返回 `gpu: true` 且 `batch_supported: true`
 - [ ] 已演练过一次「健康检查失败 → 自动回滚」
 - [ ] 反向代理 + HTTPS 证书就绪（子域名，如 `faces.zrc.sg`）
-- [ ] Postgres 数据卷已纳入备份，**且已完整演练过一次恢复**
+- [ ] 宿主机 Postgres 已纳入备份（pg_dump cron），**且已完整演练过一次恢复**
 - [ ] 隐私告知文案与同意勾选已上线
 - [ ] 邀请码已通过安全渠道分发给成员
 - [ ] 阈值已用评估集标定（见 `evaluation.md`），不是默认占位值
