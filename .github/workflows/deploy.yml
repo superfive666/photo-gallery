@@ -74,10 +74,12 @@ jobs:
 
       # 迁移必须在新代码启动之前。DDL 只做向后兼容的新增，所以旧代码在这个窗口期
       # 仍能正常工作。反过来（先换代码后迁移）会有一段新代码访问不存在列的时间。
+      # 数据库是宿主机上的 Postgres（不在 compose 里），jobs 容器经
+      # host.docker.internal 连它 —— 连不上就查 listen_addresses / pg_hba / ufw，
+      # 见 docs/deployment.md。
       - name: 执行数据库迁移
         run: |
           cd "$DEPLOY_DIR"
-          docker compose up -d db
           docker compose run --rm jobs python -m jobs migrate
 
       - name: 滚动重启

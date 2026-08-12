@@ -8,9 +8,11 @@
 
 ## 架构速览
 
-五个容器，`docker compose` 编排：
+四个容器（`docker compose` 编排）+ 宿主机数据库：
 
-- `db` — Postgres 16 + pgvector，唯一状态所在地
+- **数据库不在 compose 里**：生产连宿主机上已有的 Postgres 16 + pgvector
+  （`DATABASE_URL` 指向 `host.docker.internal`），唯一状态所在地。
+  本地开发可叠加 `docker-compose.localdb.yml` 起一个容器化 pg。
 - `embedding` — FastAPI + InsightFace buffalo_l（ONNXRuntime，CPU 或 CUDA），**唯一**做人脸
   检测/embedding 的地方。`/extract` 单张（在线检索）、`/extract/batch` 批量（离线建库）
 - `api` — FastAPI，鉴权 + 检索 + 缩略图分发，不含模型

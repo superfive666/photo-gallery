@@ -30,8 +30,8 @@ outdated: ## 列出可升级的依赖，不改动 uv.lock
 # 容器环境
 # ---------------------------------------------------------------------------
 .PHONY: up
-up: ## 起 db + embedding + api + web
-	$(COMPOSE) up -d db embedding api web
+up: ## 起 embedding + api + web（本地 localdb 叠加层会顺带起容器化 pg）
+	$(COMPOSE) up -d embedding api web
 
 .PHONY: down
 down: ## 停掉全部容器（保留数据卷）
@@ -56,12 +56,14 @@ build: ## 重建全部镜像
 migrate: ## 顺序执行 docs/schema/*.sql（跳过已应用的版本）
 	$(COMPOSE) run --rm jobs python -m jobs migrate
 
+# psql / backup 操作的是 localdb 叠加层里的容器化 pg（本地开发用）。
+# 生产的数据库在宿主机上，直接用宿主机的 psql / pg_dump，见 docs/deployment.md。
 .PHONY: psql
-psql: ## 进 psql
+psql: ## 进本地容器化 pg 的 psql（生产用宿主机 psql）
 	$(COMPOSE) exec db psql -U $${POSTGRES_USER:-gallery} -d $${POSTGRES_DB:-photo_gallery}
 
 .PHONY: backup
-backup: ## 导出数据库到 ./backups/
+backup: ## 导出本地容器化 pg 到 ./backups/（生产备份见 docs/deployment.md）
 	@mkdir -p backups
 	$(COMPOSE) exec -T db pg_dump -U $${POSTGRES_USER:-gallery} -Fc $${POSTGRES_DB:-photo_gallery} \
 		> backups/photo_gallery-$$(date +%Y%m%d-%H%M%S).dump

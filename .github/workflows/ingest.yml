@@ -50,11 +50,12 @@ jobs:
           test -f .deployed-tag || { echo "::error::还没有成功部署过，先跑 Deploy"; exit 1; }
           echo "IMAGE_TAG=$(cat .deployed-tag)" >> "$GITHUB_ENV"
 
+      # 数据库是宿主机 Postgres，常驻，不需要起；只确保 embedding 在。
       - name: 确认服务在运行
         run: |
           set -eu
           cd "$DEPLOY_DIR"
-          docker compose up -d db embedding
+          docker compose up -d embedding
           # embedding 加载模型需要时间，等它 healthy 再开始
           for _ in $(seq 1 30); do
             status=$(docker compose ps -q embedding | xargs docker inspect -f '{{.State.Health.Status}}')

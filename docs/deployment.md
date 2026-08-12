@@ -15,8 +15,8 @@
 │ 192.168.0.15     │        │ 192.168.0.12                     │
 │ Raspberry Pi 5   │        │ NVIDIA GPU                       │
 │ arm64、无 GPU    │        │ 就地 build → migrate → up        │
-│                  │        │ compose: db api web embedding    │
-│ runner 已注册，  │        │ pgdata 卷 / .env / 反向代理      │
+│                  │        │ compose: api web embedding(GPU)  │
+│ runner 已注册，  │        │ 宿主机 Postgres / .env / 反向代理│
 │ 暂无分配的 job   │        │ 镜像只存在于本机，无仓库         │
 └──────────────────┘        └────────────┬─────────────────────┘
                                          │ 443
@@ -255,12 +255,75 @@ sudo systemctl restart docker
 docker run --rm --gpus all ubuntu:24.04 nvidia-smi
 ```
 
-### 2.3 生产状态目录
+### 2.3 宿主机 Postgres
+
+数据库用这台机器上**已有的 Postgres**，不跑容器化 pg。容器（api / jobs）经
+`host.docker.internal` 访问它 —— compose 里的 `extra_hosts: host-gateway` 会把这个
+名字解析成宿主机在 docker 网桥上的地址（通常是 `172.17.0.1`）。
+
+**① 装 pgvector**（HNSW 需要 ≥ 0.5，apt 的包跟着你的 pg 大版本走）：
+
+```bash
+psql --version                       # 先确认大版本，比如 16
+sudo apt-get install -y postgresql-16-pgvector
+```
+
+**② 建用户、建库、预建扩展**（以 postgres 超级用户执行一次）：
+
+```bash
+sudo -u postgres psql <<'SQL'
+CREATE USER gallery WITH PASSWORD '<与 .env 的 DATABASE_URL 一致>';
+CREATE DATABASE photo_gallery OWNER gallery;
+\c photo_gallery
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+SQL
+```
+
+> ⚠️ **扩展必须在这里预建。** 迁移脚本里虽然写了 `CREATE EXTENSION IF NOT EXISTS`，
+> 但 `vector` 不是 trusted 扩展，`gallery` 这种普通用户**建不了**，只能跳过已存在的。
+> 漏了这步，第一次 migrate 就会报 permission denied。
+
+**③ 让 pg 接受来自 docker 网段的连接**。改两个文件（路径随大版本，如
+`/etc/postgresql/16/main/`）：
+
+`postgresql.conf`：
+
+```
+listen_addresses = '*'        # 或至少加上 172.17.0.1；只听 localhost 是容器连不上的头号原因
+```
+
+`pg_hba.conf` 加一行（放在默认 reject 规则之前）：
+
+```
+host  photo_gallery  gallery  172.16.0.0/12  scram-sha-256
+```
+
+```bash
+sudo systemctl restart postgresql
+```
+
+`172.16.0.0/12` 覆盖 docker 默认网桥和 compose 自建网络的整个私有段。
+配合下面 2.7 的 ufw 规则，pg 对外仍然是关着的 —— 能到 5432 的只有本机和容器。
+
+**④ 验证**（用一个临时容器从 docker 网段里连一次，模拟 api/jobs 的真实路径）：
+
+```bash
+docker run --rm --add-host=host.docker.internal:host-gateway postgres:16-alpine \
+  psql "postgresql://gallery:<密码>@host.docker.internal:5432/photo_gallery" \
+  -c "SELECT extname FROM pg_extension"
+```
+
+要看到 `vector` 和 `pgcrypto`。连接被拒 → 查 ③ 的两个文件和 ufw；
+密码错 → 和 `.env` 的 `DATABASE_URL` 对一遍。
+
+### 2.4 生产状态目录
 
 ```bash
 sudo mkdir -p /opt/photo-gallery/data/{sample-albums,eval}
-sudo mkdir -p /srv/backups
-sudo chown -R ghrunner:ghrunner /opt/photo-gallery /srv/backups
+sudo chown -R ghrunner:ghrunner /opt/photo-gallery
+# 备份目录归 postgres：备份 cron 以 postgres 身份跑（见「日常运维」）
+sudo install -d -o postgres -g postgres -m 750 /srv/backups
 ```
 
 目录里最终是这些东西：
@@ -277,7 +340,7 @@ sudo chown -R ghrunner:ghrunner /opt/photo-gallery /srv/backups
 > 第二次部署时 `.env` 就没了，服务会带着默认密码重启。这就是要有 `/opt/photo-gallery`
 > 这个目录的全部原因。构建在工作区里做，但读的是这里的 `.env`。
 
-### 2.4 写 `.env`
+### 2.5 写 `.env`
 
 以 `ghrunner` 身份，用仓库里的 `.env.example` 打底：
 
@@ -293,11 +356,13 @@ chmod 600 .env
 
 ```dotenv
 # 密码/密钥：用 openssl rand -base64 36 生成，别复用
-POSTGRES_PASSWORD=<随机>
-DATABASE_URL=postgresql+asyncpg://gallery:<同上>@db:5432/photo_gallery
 JWT_SECRET=<随机>
 AUDIT_HASH_SALT=<随机>
 INVITE_CODE_HASH=<见下>
+
+# 宿主机 pg（2.3 建好的那个库）。密码与 CREATE USER 时一致。
+# POSTGRES_* 三个变量是本地容器化 pg 用的，生产可以直接删掉。
+DATABASE_URL=postgresql+asyncpg://gallery:<密码>@host.docker.internal:5432/photo_gallery
 
 # 这台机器有 GPU：叠加 GPU 层 + 打开运行时开关
 COMPOSE_FILE=docker-compose.yml:docker-compose.gpu.yml
@@ -331,7 +396,7 @@ uv run python -m api.app.tools.hash_invite
 
 确认：`stat -c %a /opt/photo-gallery/.env` 输出 `600`。
 
-### 2.5 反向代理与 HTTPS
+### 2.6 反向代理与 HTTPS
 
 Caddy 自动签发/续期证书，配置最短：
 
@@ -373,7 +438,7 @@ Caddy 默认会带上 `X-Forwarded-For`。容器里的 nginx 用 `real_ip` 还�
 （见 `web/nginx.conf` 里那段注释）—— **前提是 8080 只绑 127.0.0.1**。
 把 8080 暴露出去，任何人都能自己塞一个 `X-Forwarded-For` 绕过 api 的按 IP 限流。
 
-### 2.6 防火墙
+### 2.7 防火墙
 
 ```bash
 sudo ufw allow from 192.168.0.0/24 to any port 22 proto tcp
@@ -381,8 +446,14 @@ sudo ufw allow 80,443/tcp
 sudo ufw --force enable
 ```
 
-5432（Postgres）与 8080（web）都不放行：前者在 compose 内网里只 `expose` 不映射，
-后者只绑 127.0.0.1。路由器上也**只**转发 80/443。
+8080（web）不放行 —— 它只绑 127.0.0.1。5432（Postgres）只对 docker 网段开：
+
+```bash
+sudo ufw allow from 172.16.0.0/12 to any port 5432 proto tcp
+```
+
+（容器到宿主机服务的流量走 INPUT 链，ufw 默认 deny 会拦掉它 —— pg_hba 放行了
+也没用，这条规则不能省。）路由器上也**只**转发 80/443。
 
 ---
 
@@ -456,7 +527,6 @@ sudo ufw --force enable
    ```bash
    cd /opt/photo-gallery
    export IMAGE_TAG=manual
-   docker compose up -d db
    docker compose run --rm jobs python -m jobs migrate
    docker compose up -d embedding api web
    docker compose exec embedding python -c \
@@ -495,23 +565,26 @@ sudo ufw --force enable
 
 ## 6. 日常运维
 
-### 备份（以 `ghrunner` 身份）
+### 备份（宿主机 pg，以 `postgres` 身份）
 
-`crontab -u ghrunner -e`：
+数据库在宿主机上，备份就是普通的 `pg_dump`，不经过任何容器。
+`sudo crontab -u postgres -e`：
 
 ```cron
 # 每天 03:30 备份，保留 14 天。cron 里 % 必须转义。
-30 3 * * * cd /opt/photo-gallery && docker compose exec -T db pg_dump -U gallery -Fc photo_gallery > /srv/backups/pg-$(date +\%F).dump 2>>/srv/backups/backup.log
+30 3 * * * pg_dump -Fc photo_gallery > /srv/backups/pg-$(date +\%F).dump 2>>/srv/backups/backup.log
 0 4 * * 0 find /srv/backups -name 'pg-*.dump' -mtime +14 -delete
 ```
+
+（postgres 本地 peer 认证免密码；`/srv/backups` 在 2.4 已经 chown 给它了。）
 
 **演练一次恢复，否则不算有备份**（`docs/cicd.md` 的清单里有这一条）：
 
 ```bash
-docker compose exec -T db createdb -U gallery restore_test
-docker compose exec -T db pg_restore -U gallery -d restore_test < /srv/backups/pg-2026-08-11.dump
-docker compose exec -T db psql -U gallery -d restore_test -c 'select count(*) from face;'
-docker compose exec -T db dropdb -U gallery restore_test
+sudo -u postgres createdb -O gallery restore_test
+sudo -u postgres pg_restore -d restore_test /srv/backups/pg-2026-08-11.dump
+sudo -u postgres psql -d restore_test -c 'select count(*) from face;'
+sudo -u postgres dropdb restore_test
 ```
 
 缩略图是 BYTEA，备份体积基本等于 `照片数 × 缩略图大小`，几万张照片是几个 GB 量级。
@@ -565,6 +638,9 @@ cd /opt/photo-gallery && docker compose logs -f --tail=100 api
 | 第二次部署后连不上数据库 | `.env` 被 `git clean` 删过 —— 确认它在 `/opt/photo-gallery` 而不是 runner 工作区 |
 | 一个人搜几次全站就被限流 | `real_ip` 没生效或 8080 被暴露，所有请求的来源 IP 塌成了同一个 |
 | `ingest` 跑完 0 张入库 | 相册页解析没收敛，先跑 `jobs probe`（见 [`data-source.md`](data-source.md)） |
+| migrate 报 connection refused | pg 只听 localhost（`listen_addresses`），或 ufw 没放行 docker 网段（2.3③ / 2.7） |
+| migrate 报 no pg_hba.conf entry | `pg_hba.conf` 少了 172.16.0.0/12 那行，或加在了 reject 之后 |
+| migrate 报 permission denied to create extension | 扩展没预建 —— 回 2.3② 以超级用户建 `vector` / `pgcrypto` |
 | 回滚报「本机已经没有 xxx 的镜像」 | 旧镜像被 prune 或手动清掉了。只能人工修，或直接重跑一次部署 |
 
 ---

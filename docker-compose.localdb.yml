@@ -1,0 +1,42 @@
+# 本地开发用的容器化 Postgres 叠加层。**生产不用它** —— 生产连宿主机上
+# 已有的 Postgres（见 docs/deployment.md 的「宿主机 Postgres」一节）。
+#
+# 用法：本地 .env 里
+#     COMPOSE_FILE=docker-compose.yml:docker-compose.localdb.yml
+# .env.example 的默认值就是这个，所以本地 `make up` 开箱即用；
+# 生产机的 .env 把它换成 gpu 叠加层，db 服务就完全不存在。
+#
+# DATABASE_URL 相应指向 db:5432（.env.example 的默认值）。
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # 不映射到宿主机：数据库只应在 compose 内网可达。
+    # 本地调试临时需要时，用 `docker compose port db 5432` 或临时加 ports。
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # 有了容器库，启动顺序才需要编排（生产上宿主机 pg 常驻，不存在这个问题）
+  api:
+    depends_on:
+      db:
+        condition: service_healthy
+  jobs:
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
