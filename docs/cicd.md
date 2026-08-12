@@ -34,8 +34,10 @@ main  ──●────────●────────●───�
 3. **PR 的 CI 跑在 GitHub 托管 runner 上**（lint/test/build，无 secrets、无部署权限）；
    **只有部署 job 跑在自建 runner 上**，且仅由 `push: main` 与手动 `workflow_dispatch` 触发。
    这是本项目的核心隔离原则。
-4. Runner 以**非 root 专用账户**运行，不加入 docker 组以外的特权组，
-   工作目录与生产数据卷分离。
+4. Runner 以**非 root 专用账户**运行，**只加 `docker` 组，不进 `sudo`**
+   （workflow 里一句 sudo 都没有；给了就等于任何能改 workflow 的人都能无条件 root）。
+   工作目录与生产数据卷分离。真需要某一条 root 命令时用最窄的 `sudoers.d` 白名单，
+   见 [`deployment.md` 第 1 节](deployment.md#步骤)。
 5. 每个 job 结束后清理工作区（`actions/checkout` 默认会 clean，但构建缓存要自己管）。
 6. Runner 用**标签**精确选中（`runs-on` 匹配 label 而不是 name），避免误跑到别的机器：
    - `superfive-ubuntu` = 192.168.0.12，构建 + 部署 + 定时建库；

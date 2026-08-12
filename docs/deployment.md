@@ -79,9 +79,30 @@ sudo useradd -m -s /bin/bash ghrunner
 sudo usermod -aG docker ghrunner     # 要先装好 docker，见第 2 节
 ```
 
-> ⚠️ `docker` 组等价于 root（能把宿主机根目录挂进容器）。这正是「这两台 runner 只执行
-> 我们自己的部署步骤，PR 的 lint/test 继续跑在 GitHub 托管 runner 上」这条纪律的原因
-> （CLAUDE.md 约束 9）。
+**只加 `docker` 组，不要把 `ghrunner` 加进 `sudo`。** workflow 里一句 sudo 都没有，
+运行时需要的权限只有两样：docker socket，以及对 `/opt/photo-gallery` 和 `/srv/backups`
+的写权限（第 2.3 节的 `chown` 给了）。文档里那些 `sudo` 都是**你本人**做的一次性安装
+动作，不是 runner 需要的能力。
+
+> 为什么要专门强调 —— 交互式 sudo 在非交互的 runner 里根本用不了，所以「给 sudo」
+> 实际只有 `NOPASSWD` 一种可用形式，而那等于：任何能改 workflow 文件的人（包括被
+> 接受的一个 PR）都能在这台机器上无条件 root。
+>
+> 有人会说 `docker` 组本来就等价于 root（能把宿主机根目录挂进容器），加 sudo 没区别。
+> 差别在三点：docker 组这个洞要**刻意**去利用，而 workflow 里的一行 `sudo` 在 diff
+> 里看起来平平无奇；docker 组是这个项目**必需**的权限，sudo 不是；将来若换成 rootless
+> docker 或 socket 代理，docker 组那个洞会关上，而 sudo 会留着。
+>
+> 这也正是「两台 runner 只执行我们自己的部署步骤，PR 的 lint/test 继续跑在 GitHub
+> 托管 runner 上」这条纪律的原因（CLAUDE.md 约束 9）。
+
+如果**将来**真有某一步必须 root（比如让 workflow reload 宿主机的 Caddy），
+不要开整个 sudo，只放一条最窄的白名单：
+
+```bash
+# /etc/sudoers.d/ghrunner-caddy   （用 visudo -f 编辑，语法错会锁死 sudo）
+ghrunner ALL=(root) NOPASSWD: /usr/bin/systemctl reload caddy
+```
 
 **② 拿注册 token**
 
