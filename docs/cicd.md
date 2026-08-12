@@ -49,11 +49,13 @@ main  ──●────────●────────●───�
 
 | 机器 | 硬件 | Runner 标签 | 职责 |
 | --- | --- | --- | --- |
-| `192.168.0.15` | 无 GPU | `zrc-ci` | `docker compose build` → 推内网 registry `:5000` |
+| `192.168.0.15` | 无 GPU | `zrc-ci` | `docker compose build` → push 到 Docker Hub 私有仓库 |
 | `192.168.0.12` | NVIDIA GPU | `zrc-prod` | `pull` → `migrate` → `up -d` → 健康检查；定时 ingest |
 
-镜像走 `.15` 上的私有 registry，不走 GHCR（家宽上行 + GitHub Packages 存储额度都吃不下
-GB 级的 GPU 版 embedding 镜像）；部署靠 `.12` 上的第二个 runner，不走 SSH
+两台机器的 runner 装法完全一样，只有 `--name` / `--labels` 不同 —— 步骤见
+[`deployment.md` 1.2](deployment.md#12-github-actions-runner)。
+
+镜像走 Docker Hub 私有仓库；部署靠 `.12` 上的第二个 runner，不走 SSH
 （否则要把生产机私钥交给 CI 平台）。完整理由见
 [`plans/0004-two-host-cicd.md`](plans/0004-two-host-cicd.md#决策与理由)，
 两台机器的逐步配置见 [`deployment.md`](deployment.md)。
@@ -65,7 +67,7 @@ GB 级的 GPU 版 embedding 镜像）；部署靠 `.12` 上的第二个 runner�
 | 文件 | 触发 | Runner | 作用 |
 | --- | --- | --- | --- |
 | `.github/workflows/ci.yml` | `pull_request`、`push: main` | GitHub 托管 | lint、typecheck、test、docker build（不 push） |
-| `.github/workflows/deploy.yml` job `build` | `push: main`、`workflow_dispatch` | **自建** `zrc-ci` | 构建四个镜像 → 推 registry（`sha-<short>` + `latest`） |
+| `.github/workflows/deploy.yml` job `build` | `push: main`、`workflow_dispatch` | **自建** `zrc-ci` | 构建四个镜像 → 推 Docker Hub（`sha-<short>` + `latest`） |
 | `.github/workflows/deploy.yml` job `deploy` | 同上，`needs: build` | **自建** `zrc-prod` | pull → 迁移 → 滚动重启 → 健康检查 → 失败回滚 |
 | `.github/workflows/ingest.yml` | `schedule`、`workflow_dispatch` | **自建** `zrc-prod` | 定时增量建库（用已部署的 tag，不用 `latest`） |
 
@@ -89,7 +91,7 @@ job build  (zrc-ci  = .15)
   ① checkout
   ② tag = sha-<short>
   ③ docker compose --profile tools build   （EMBEDDING_GPU=true）
-  ④ push <tag> 与 latest 到 192.168.0.15:5000
+  ④ push <tag> 与 latest 到 Docker Hub
 
 job deploy (zrc-prod = .12，needs: build)
   ⑤ 校验 /opt/photo-gallery/.env 存在且权限 600
@@ -134,10 +136,13 @@ on:
 
 ## 镜像与版本
 
-- 镜像推到 **`.15` 上的私有 registry**（`192.168.0.15:5000/photo-gallery/<service>`），
-  仓库 Variable `IMAGE_REPO` 可改成 GHCR 之类。
-  不默认用 GHCR 的原因：GPU 版 embedding 镜像是 GB 级的，家宽上行是最慢的一环，
-  而 GitHub Packages 对 private 仓库的存储是计费额度（Free 500MB）。
+- 镜像推到 **Docker Hub 私有仓库**。Docker Hub 的仓库名只有两级，所以四个服务是
+  四个仓库：`superfive666/photo-gallery-{api,jobs,web,embedding}`。
+  仓库 Variable `IMAGE_PREFIX` 可改成 GHCR 或内网 registry，workflow 不用动。
+  ⚠️ **Docker Hub 免费版只含 1 个私有仓库**，四个需要 Pro ——
+  见 [`deployment.md` 第 0 节](deployment.md#-私有仓库数量先确认你的-docker-hub-套餐)。
+- GB 级的 GPU 版 embedding 镜像要经家宽上传再下载一遍。按层去重，
+  所以只有第一次疼；改业务代码时只传最后一个小层。
 - Tag 规则：`sha-<short>`（每次构建）+ `latest`（方便人工排查）。
   部署时用 `sha-` tag；定时 ingest 用 `.deployed-tag` 里那个，**不用 `latest`** ——
   `latest` 可能已经指向一个还没通过部署验证的构建。
@@ -149,15 +154,17 @@ on:
 
 ## Secrets 与 Variables
 
-**这个拓扑下 GitHub Secrets 一个都不需要。** 镜像走内网 registry、部署靠 `.12` 上的
+**这个拓扑下 GitHub Secrets 一个都不需要。** Docker Hub 凭据由两台机器各自
+`docker login` 存在本地（`.15` 读写 token、`.12` 只读 token）、部署靠 `.12` 上的
 runner 而不是 SSH 密钥、生产 `.env` 只存在于 `.12` 上 —— 没有任何机密需要经过 GitHub。
-少一处存放就少一处泄漏面。
+少一处存放就少一处泄漏面。想集中轮换的话，改成 Secrets + `docker/login-action` 也能跑，
+代价是凭据要经过 CI 平台。
 
 需要的是几个非机密的 Variables（都有默认值，可以不设）：
 
 | Variable | 默认 | 用途 |
 | --- | --- | --- |
-| `IMAGE_REPO` | `192.168.0.15:5000/photo-gallery` | 镜像仓库前缀 |
+| `IMAGE_PREFIX` | `superfive666/photo-gallery` | 镜像仓库名前缀（`-api`、`-web`… 由 workflow 拼） |
 | `DEPLOY_DIR` | `/opt/photo-gallery` | 生产状态目录 |
 | `VITE_API_BASE_URL` | `/api` | 前端构建期注入的 api 地址 |
 
@@ -176,6 +183,7 @@ runner 而不是 SSH 密钥、生产 `.env` 只存在于 `.12` 上 —— 没有
 
 - [ ] 仓库为 private，或已按上文配置 fork PR 审批
 - [ ] 两个 runner 都以非 root 专用账户运行，标签分别为 `zrc-ci` / `zrc-prod`
+- [ ] 两台机器都以 runner 账户 `docker login` 过，Docker Hub 上四个仓库都是 Private
 - [ ] `main` 分支保护规则已开启（仓库目前还没有 `main`）
 - [ ] `.env` 已就位、权限 600，且**不在** runner 工作区里
 - [ ] `.12` 上 `docker run --rm --gpus all ubuntu nvidia-smi` 能出卡

@@ -1,9 +1,12 @@
 name: Deploy
 
 # 两台自建 runner：
-#   build  → zrc-ci   (192.168.0.15, 无 GPU) 构建镜像并推内网 registry
+#   build  → zrc-ci   (192.168.0.15, 无 GPU) 构建镜像并推 Docker Hub 私有仓库
 #   deploy → zrc-prod (192.168.0.12, 有 GPU) 只 pull / migrate / up，从不构建
 # 构建机永不接触 .env 和生产数据库；生产机永不执行测试代码。见 docs/deployment.md。
+#
+# Docker Hub 的凭据不放 GitHub Secrets：两台机器各自 `docker login` 一次
+# （.15 用读写 token，.12 用只读 token），凭据留在机器上不经过 CI 平台。
 #
 # 只由 main 分支的 push 和手动触发驱动 —— 绝不接受 pull_request。
 # fork 的 PR 永远不该在家用机器上执行代码。见 docs/cicd.md 的安全前提。
@@ -21,8 +24,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # 内网 registry。仓库 Variables 里设 IMAGE_REPO 可覆盖（例如换成 GHCR）。
-  IMAGE_REPO: ${{ vars.IMAGE_REPO || '192.168.0.15:5000/photo-gallery' }}
+  # Docker Hub 私有仓库的前缀。四个服务是四个仓库：<prefix>-api、-jobs、-web、-embedding。
+  # 仓库 Variables 里设 IMAGE_PREFIX 可覆盖（换 GHCR 或内网 registry 只改这一个值）。
+  IMAGE_PREFIX: ${{ vars.IMAGE_PREFIX || 'superfive666/photo-gallery' }}
 
 jobs:
   build:
@@ -48,6 +52,18 @@ jobs:
         id: meta
         run: echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
+      # 凭据是机器上 `docker login` 存下来的，不经过 GitHub。这里只做存在性检查 ——
+      # 否则 token 被撤销时会在 push 那一步报一句难以定位的 401。
+      - name: 确认已登录 Docker Hub
+        run: |
+          set -eu
+          grep -q 'index.docker.io' "$HOME/.docker/config.json" 2>/dev/null || {
+            echo "::error::这台机器还没登录 Docker Hub。以 runner 账户执行："
+            echo "::error::  echo <token> | docker login -u <用户名> --password-stdin"
+            echo "::error::见 docs/deployment.md 1.3"
+            exit 1
+          }
+
       # tools profile 把一次性容器 jobs 也带进来 —— 迁移要用它
       - name: 构建
         env:
@@ -56,16 +72,19 @@ jobs:
 
       # 逐个 push 而不是 `docker compose push`：后者会把 db 的上游镜像
       # （pgvector/pgvector）也一并尝试推送，那是别人的 repository，必然失败。
-      - name: 推到 registry
+      #
+      # 第一次 push 会把 GB 级的 embedding 镜像整个传上去，家宽上行会疼一次。
+      # 之后只传变化的层 —— onnxruntime-gpu 与模型权重在依赖层里，改业务代码不动它们。
+      - name: 推到 Docker Hub
         env:
           IMAGE_TAG: ${{ steps.meta.outputs.tag }}
         run: |
           set -eu
           for svc in api jobs web embedding; do
-            docker push "$IMAGE_REPO/$svc:$IMAGE_TAG"
+            docker push "$IMAGE_PREFIX-$svc:$IMAGE_TAG"
             # 同时推一个 latest，方便人工排查时不用记 sha
-            docker tag "$IMAGE_REPO/$svc:$IMAGE_TAG" "$IMAGE_REPO/$svc:latest"
-            docker push "$IMAGE_REPO/$svc:latest"
+            docker tag "$IMAGE_PREFIX-$svc:$IMAGE_TAG" "$IMAGE_PREFIX-$svc:latest"
+            docker push "$IMAGE_PREFIX-$svc:latest"
           done
 
       - name: 清理悬空镜像
@@ -105,6 +124,15 @@ jobs:
           mkdir -p "$DEPLOY_DIR/docs"
           rm -rf "$DEPLOY_DIR/docs/schema"
           cp -r docs/schema "$DEPLOY_DIR/docs/schema"
+
+      # 私有仓库，拉取也要凭据。这台机器上的 token 应该是**只读**的。
+      - name: 确认已登录 Docker Hub
+        run: |
+          set -eu
+          grep -q 'index.docker.io' "$HOME/.docker/config.json" 2>/dev/null || {
+            echo "::error::这台机器还没登录 Docker Hub，见 docs/deployment.md 2.4"
+            exit 1
+          }
 
       - name: 拉取镜像
         run: |

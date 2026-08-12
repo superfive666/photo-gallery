@@ -94,7 +94,7 @@ CI 用 `uv sync --frozen`：改了依赖但忘记提交 `uv.lock` 会直接失�
 
 ## 部署
 
-两台内网机器：一台无 GPU 只负责构建镜像并推内网 registry，一台有 GPU 只负责
+两台内网机器：一台无 GPU 只负责构建镜像并推 Docker Hub 私有仓库，一台有 GPU 只负责
 `pull → 迁移 → 滚动重启`。构建机不接触 `.env` 与数据库，生产机不执行测试代码。
 
 从裸 Ubuntu 到上线的逐步 runbook 见 [`docs/deployment.md`](docs/deployment.md)；

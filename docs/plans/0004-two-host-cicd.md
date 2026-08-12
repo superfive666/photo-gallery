@@ -23,6 +23,8 @@
 
 - 新增 `docker-compose.gpu.yml`（GPU 设备声明，只在 `.12` 上叠加）。
 - `docker-compose.yml` 的四个可构建服务补 `image:` 字段 —— 没有它就没法 pull。
+  用 `${IMAGE_PREFIX}-<svc>:${IMAGE_TAG}` 的形式，一个变量就能在
+  「本地 / Docker Hub / GHCR / 内网 registry」之间切换。
 - `deploy.yml` 拆成 `build`（`zrc-ci` = .15）→ `deploy`（`zrc-prod` = .12）两个 job。
 - 生产状态目录固定为 `/opt/photo-gallery`，`.env` 放那里。
 - `web/nginx.conf` 加 `real_ip` —— 前面多了一层宿主机反向代理之后必须的修正。
@@ -37,21 +39,29 @@
 
 ## 决策与理由
 
-### 镜像怎么从 .15 到 .12：内网 registry，不用 GHCR
+### 镜像怎么从 .15 到 .12：Docker Hub 私有仓库
 
-`.15` 上跑一个 `registry:2`，`.12` 从 `192.168.0.15:5000` 拉。
+`.15` push，`.12` pull，中间过一趟公网。
 
-- GHCR 要把镜像经家宽**上传**再**下载**一遍。GPU 版 embedding 镜像（onnxruntime-gpu
-  + CUDA 运行时 + 300MB 模型权重）是 GB 级的，家宽上行是这条链路上最慢的一环。
-- GitHub Packages 对 private 仓库的存储是**计费额度**（Free 500MB / Pro 2GB），
-  一个 GB 级镜像加上历史 tag 会直接超额。
-- 内网 registry 走千兆，且按层增量传输 —— 改业务代码时只有最后几层动。
+我原本提的是「`.15` 上跑内网 `registry:2`」，理由是 GPU 版 embedding 镜像
+（onnxruntime-gpu + CUDA 运行时 + 300MB 模型权重）是 GB 级的，家宽上行是这条链路上
+最慢的一环。**这个代价现在是明确接受的**，换来的是不用自己运维 registry、
+不用给两台机器开 `insecure-registries`、镜像有一份异地副本。
 
-代价：registry 是明文 HTTP，两台机器都要加 `insecure-registries`。可接受，因为
-**镜像里不含任何 secret**（secret 全在 `.12` 的 `.env` 里），且端口只绑内网地址。
-想上 TLS 的话换成给 registry 签一张内网证书即可，workflow 不用改。
+实际影响比第一直觉小：Docker Hub 也是按层去重的，那些大层在依赖层里，
+改业务代码时只传最后一个小层。疼的是**第一次** push 和第一次 pull。
+
+镜像命名要注意：Docker Hub 的仓库名只有 `<用户>/<仓库>` 两级，不能像 GHCR 那样
+`ghcr.io/<用户>/<项目>/<服务>` 三级。所以 `IMAGE_PREFIX` 是**仓库名前缀**而不是命名空间：
+`superfive666/photo-gallery-api`。四个服务 = 四个仓库，而
+**Docker Hub 免费版只含 1 个私有仓库** —— 这一条写进了 `deployment.md` 第 0 节，
+需要 Pro，或者退回内网 registry / 合并成一个仓库用 tag 前缀区分。
 
 不用 `docker save | ssh docker load`：每次都要传全量，且要维护跨机 SSH 密钥。
+
+凭据不进 GitHub Secrets：两台机器各自 `docker login` 一次（`.15` 读写 token、
+`.12` 只读 token），凭据不经过 CI 平台。给生产机只读 token 是因为改镜像等于
+下次部署时在生产机上执行任意代码。
 
 ### 部署怎么触发：在 .12 上再装一个 runner，不用 SSH
 
@@ -76,8 +86,8 @@
 
 ## 验收标准
 
-- [ ] `.15` 上 `docker compose build` 后 `docker compose push` 成功，registry 里能看到
-      四个 repository 的 `sha-<short>` 与 `latest`。
+- [ ] Docker Hub 上四个仓库都是 **Private**（`docker push` 自动建出来的是 public）。
+- [ ] `.15` 上 build + push 成功，Docker Hub 上四个仓库都有 `sha-<short>` 与 `latest`。
 - [ ] `.12` 上 `docker compose pull` 拿到同一批镜像，`docker compose ps` 四个服务 healthy。
 - [ ] `curl -s localhost:8000/healthz` 在 embedding 容器里返回 `gpu: true` 且
       `batch_supported: true`。
