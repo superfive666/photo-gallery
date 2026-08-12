@@ -184,7 +184,8 @@ runner 而不是 SSH 密钥、生产 `.env` 只存在于 `.12` 上 —— 没有
 - [ ] 仓库为 private，或已按上文配置 fork PR 审批
 - [ ] 两个 runner 都以非 root 专用账户运行，**label**（不只是 name）分别为
       `superfive-ubuntu` / `superfive-pi5`
-- [ ] `main` 分支保护规则已开启（仓库目前还没有 `main`）
+- [ ] 默认分支已切到 `main`（`schedule` 触发的 workflow 只从默认分支跑）
+- [ ] `main` 分支保护规则已开启
 - [ ] `.env` 已就位、权限 600，且**不在** runner 工作区里
 - [ ] `.12` 上 `docker run --rm --gpus all ubuntu nvidia-smi` 能出卡
 - [ ] embedding 的 `/healthz` 返回 `gpu: true` 且 `batch_supported: true`

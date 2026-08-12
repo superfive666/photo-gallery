@@ -424,10 +424,17 @@ sudo ufw --force enable
 - Fork pull request workflows → *Require approval for all outside collaborators*
   （仓库现在是 private，属于兜底）。
 
-**分支**：仓库目前**还没有 `main`**，默认分支就是
-`claude/face-recognition-photo-gallery-gkjfbx`，所以 `push: main` 那两个触发器现在
-永远不会触发。首次上线可以直接用 **Run workflow**（`workflow_dispatch`）手动跑。
-正式建 `main` 时按 `docs/cicd.md` 打开分支保护。
+**分支**：`main` 建立之后还有两步只能在网页上做：
+
+1. **Settings → General → Default branch** 切到 `main`。
+   `schedule` 触发的 workflow（ingest 的每日 cron）**只从默认分支跑**，
+   不切的话定时建库永远不会启动。
+2. **Settings → Branches** 给 `main` 开分支保护：禁止直推、必须经 PR、
+   必须 CI 通过（勾上 `python` / `web` / `docker` 三个 check）。
+   规则见 `docs/cicd.md` 的分支模型。
+
+⚠️ 合并进 `main` 会**立刻触发 Deploy**。生产机还没按第 2 节初始化完时，
+它会在第一步「检查生产目录与 .env」就停下 —— 这是故意的挡板，不是事故。
 
 ---
 
