@@ -9,7 +9,10 @@ ENV PYTHONUNBUFFERED=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never \
-    # InsightFace 默认把模型放在 ~/.insightface
+    # ⚠️ insightface 本身不读这个环境变量（它只认 FaceAnalysis(root=...) 参数）。
+    # 这是**我们自己的**约定：下面的下载步骤和 embedding/app/model.py 都从这里读，
+    # 从而保证「构建时下载到哪」和「运行时去哪找」是同一个目录。
+    # 不用默认的 ~/.insightface 是因为构建以 root 跑、运行以 appuser 跑，家目录不同。
     INSIGHTFACE_HOME=/opt/insightface
 
 # opencv-python-headless 只需要 glib，不需要 libGL ——
@@ -68,11 +71,18 @@ import os
 from insightface.app import FaceAnalysis
 
 name = os.environ.get("MODEL_NAME", "buffalo_l")
+root = os.environ["INSIGHTFACE_HOME"]
+# root 必须显式传：insightface 不读环境变量，不传就下到构建用户（root）的
+# ~/.insightface，运行时的 appuser 找不到，会在启动时联网重下。
 # prepare() 会触发下载。ctx_id=-1 表示 CPU（构建机不一定有 GPU）。
-app = FaceAnalysis(name=name, allowed_modules=["detection", "recognition"],
+app = FaceAnalysis(name=name, root=root,
+                   allowed_modules=["detection", "recognition"],
                    providers=["CPUExecutionProvider"])
 app.prepare(ctx_id=-1, det_size=(640, 640))
-print(f"model {name} downloaded")
+# 下载出问题时宁可让构建失败，也不要交付一个运行时才发现缺权重的镜像
+expected = os.path.join(root, "models", name)
+assert os.path.isdir(expected), f"模型目录不存在: {expected}"
+print(f"model {name} downloaded to {expected}")
 PY
 
 COPY embedding embedding

@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import io
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -123,6 +124,11 @@ class FaceExtractor:
         )
         app = FaceAnalysis(
             name=self.model_name,
+            # ⚠️ insightface 不认任何环境变量，模型目录只能靠这个参数传。
+            # 必须与 Dockerfile.embedding 下载权重时用的 root 完全一致，否则
+            # 运行时（appuser 身份）会去 ~/.insightface 找 → 找不到 → 联网重下，
+            # 恰好破坏「权重打进镜像、冷启动不依赖外网」的设计。
+            root=os.environ.get("INSIGHTFACE_HOME", "~/.insightface"),
             # 只要检测 + 识别；不加载年龄/性别等无关模型，省内存和加载时间
             allowed_modules=["detection", "recognition"],
             providers=providers,
