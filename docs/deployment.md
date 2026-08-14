@@ -318,8 +318,11 @@ SOURCE_LOCAL_DIR=/opt/photo-gallery/data/sample-albums
 EVAL_DIR=/opt/photo-gallery/data/eval
 ```
 
-`IMAGE_PREFIX` / `IMAGE_TAG` 保持默认 —— 没有仓库，镜像只在本机；`IMAGE_TAG` 由
-workflow 在部署时用 `sha-<short>` 覆盖。
+`IMAGE_PREFIX` 保持默认。`IMAGE_TAG` 不用管：每次部署成功后 workflow 会把它
+写成当前上线的 `sha-<short>`，所以手敲的 `docker compose` 命令默认就指向在线版本。
+⚠️ 首次部署**之前**它还是 `dev` —— 那时手动 `up`/`run` 必须显式带
+`IMAGE_TAG=$(cat .deployed-tag)`（或 manual 之类的真实 tag），否则 compose 找不到
+`:dev` 镜像会试图在没有源码的生产目录里现场构建。
 
 `INVITE_CODE_HASH` 在**任意**一台装了本项目依赖的机器上生成，只把 hash 抄过来：
 
@@ -569,6 +572,8 @@ cd /opt/photo-gallery && docker compose logs -f --tail=100 api
 | 一个人搜几次全站就被限流 | `real_ip` 没生效或 8080 被暴露，所有请求的来源 IP 塌成了同一个 |
 | `ingest` 跑完 0 张入库 | 相册页解析没收敛，先跑 `jobs probe`（见 [`data-source.md`](data-source.md)） |
 | 回滚报「本机已经没有 xxx 的镜像」 | 旧镜像被 prune 或手动清掉了。只能人工修，或直接重跑一次部署 |
+| 手动 up/recreate 报 `pull access denied` 后开始 Building，再报 `lstat .../docker: no such file` | `IMAGE_TAG` 落在了 `dev`：显式带 `IMAGE_TAG=$(cat .deployed-tag)`，或跑一次 Deploy 让它把 tag 写回 .env |
+| `docker compose` 刷一屏 `variable is not set` 警告 | `.env` 里有值含 `$` 且没加单引号（典型是 INVITE_CODE_HASH）——正是登录 500 那个坑 |
 
 ---
 
