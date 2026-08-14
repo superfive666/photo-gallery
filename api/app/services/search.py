@@ -77,7 +77,9 @@ _SEARCH_SQL = text(
     JOIN photo ph ON ph.id = c.photo_id
     WHERE c.sim >= :threshold
       AND ph.deleted_at IS NULL
-      AND (:album IS NULL OR ph.album = :album)
+      -- CAST 不能省：asyncpg 走预处理语句，纯 `:album IS NULL OR ...` 推断不出
+      -- 参数类型，album=None（不筛相册，最常见路径）会在 prepare 阶段直接 500
+      AND (CAST(:album AS text) IS NULL OR ph.album = CAST(:album AS text))
       AND NOT EXISTS (SELECT 1 FROM block_list b WHERE b.face_id  = c.face_id)
       AND NOT EXISTS (SELECT 1 FROM block_list b WHERE b.photo_id = ph.id)
     GROUP BY ph.id, ph.album, ph.photo_url, ph.thumbnail IS NOT NULL
