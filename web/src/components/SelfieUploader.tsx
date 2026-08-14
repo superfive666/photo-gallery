@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react'
 
 import { compressImage } from '../lib/compress'
+import { localId } from '../lib/local-id'
 import { PrivacyNotice } from './PrivacyNotice'
 
 const MAX_SELFIES = 3
@@ -46,7 +47,8 @@ export function SelfieUploader({
       for (const file of incoming) {
         const { file: compressed } = await compressImage(file)
         added.push({
-          id: crypto.randomUUID(),
+          // localId 而非 crypto.randomUUID：后者在非 HTTPS 的内网访问下不存在
+          id: localId(),
           file: compressed,
           previewUrl: URL.createObjectURL(compressed),
         })
