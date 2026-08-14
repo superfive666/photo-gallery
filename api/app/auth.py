@@ -14,10 +14,13 @@ from typing import Any
 
 import jwt
 from argon2 import PasswordHasher
-from argon2.exceptions import VerificationError, VerifyMismatchError
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from fastapi import HTTPException, Request, Response
 
 from gallery_core.config import Settings
+from gallery_core.logging import get_logger
+
+log = get_logger(__name__)
 
 SESSION_COOKIE = "zrc_face_session"
 _hasher = PasswordHasher()
@@ -34,6 +37,20 @@ def verify_invite_code(code: str, settings: Settings) -> bool:
         return False
     try:
         return _hasher.verify(settings.invite_code_hash, code)
+    except InvalidHashError as exc:
+        # 存储的 hash 本身格式非法 —— 这是运维配置错误，不是用户输错邀请码。
+        # 最常见的成因：argon2 hash 里全是 $，docker compose 读 .env 时把
+        # $argon2id / $v / $m 当变量引用替换成了空串。修法：.env 里给值加单引号
+        # （INVITE_CODE_HASH='$argon2id$...'），compose 与 pydantic-settings
+        # 都会按字面处理。hash_invite 工具的输出已带好引号。
+        # 这里抛 500 而不是静默返回 False：hash 坏了意味着任何人都永远登不进来，
+        # 伪装成「邀请码不正确」(401) 只会让排查绕远路。
+        log.error(
+            "invite_code_hash_invalid",
+            hint="INVITE_CODE_HASH 不是合法的 argon2 hash，"
+            "检查 .env 里 $ 是否被 compose 插值吃掉（值要用单引号包住）",
+        )
+        raise HTTPException(status_code=500, detail="服务端鉴权配置错误，请联系管理员") from exc
     except (VerifyMismatchError, VerificationError):
         return False
 

@@ -358,7 +358,9 @@ chmod 600 .env
 # 密码/密钥：用 openssl rand -base64 36 生成，别复用
 JWT_SECRET=<随机>
 AUDIT_HASH_SALT=<随机>
-INVITE_CODE_HASH=<见下>
+# ⚠️ 必须整体用单引号包住 —— hash 里全是 $，不加引号会被 compose 插值啃烂，
+# 登录直接 500。hash_invite 工具输出的就是带引号的整行，原样粘贴。
+INVITE_CODE_HASH='<见下>'
 
 # 宿主机 pg（2.3 建好的那个库）。密码与 CREATE USER 时一致。
 # POSTGRES_* 三个变量是本地容器化 pg 用的，生产可以直接删掉。
@@ -381,8 +383,11 @@ SOURCE_LOCAL_DIR=/opt/photo-gallery/data/sample-albums
 EVAL_DIR=/opt/photo-gallery/data/eval
 ```
 
-`IMAGE_PREFIX` / `IMAGE_TAG` 保持默认 —— 没有仓库，镜像只在本机；`IMAGE_TAG` 由
-workflow 在部署时用 `sha-<short>` 覆盖。
+`IMAGE_PREFIX` 保持默认。`IMAGE_TAG` 不用管：每次部署成功后 workflow 会把它
+写成当前上线的 `sha-<short>`，所以手敲的 `docker compose` 命令默认就指向在线版本。
+⚠️ 首次部署**之前**它还是 `dev` —— 那时手动 `up`/`run` 必须显式带
+`IMAGE_TAG=$(cat .deployed-tag)`（或 manual 之类的真实 tag），否则 compose 找不到
+`:dev` 镜像会试图在没有源码的生产目录里现场构建。
 
 `INVITE_CODE_HASH` 在**任意**一台装了本项目依赖的机器上生成，只把 hash 抄过来：
 
@@ -634,7 +639,8 @@ cd /opt/photo-gallery && docker compose logs -f --tail=100 api
 | 构建时一堆 `variable is not set` warning | 没带 `--env-file /opt/photo-gallery/.env` |
 | `/healthz` 里 `gpu: false` | 镜像不是 `EMBEDDING_GPU=true` 构建的；或 `.env` 少了 `EMBEDDING_USE_GPU=true`；或 `.env` 少了 `COMPOSE_FILE=...gpu.yml`（容器没挂到卡） |
 | `batch_supported: false` | 识别模型 ONNX 的 batch 维是固定 1，批量退化为逐张。需要换一份动态 batch 导出 |
-| 服务起来了但登录说邀请码错 | `INVITE_CODE_HASH` 抄漏了字符，或生成时用的明文不是分发出去的那个 |
+| 服务起来了但登录说邀请码错（401） | `INVITE_CODE_HASH` 抄漏了字符，或生成时用的明文不是分发出去的那个 |
+| 登录直接 500 | `INVITE_CODE_HASH` 没用单引号包住，`$argon2id` 等被 compose 当变量啃掉了；`docker compose logs api` 里会有 `invite_code_hash_invalid` |
 | 第二次部署后连不上数据库 | `.env` 被 `git clean` 删过 —— 确认它在 `/opt/photo-gallery` 而不是 runner 工作区 |
 | 一个人搜几次全站就被限流 | `real_ip` 没生效或 8080 被暴露，所有请求的来源 IP 塌成了同一个 |
 | `ingest` 跑完 0 张入库 | 相册页解析没收敛，先跑 `jobs probe`（见 [`data-source.md`](data-source.md)） |
@@ -642,6 +648,8 @@ cd /opt/photo-gallery && docker compose logs -f --tail=100 api
 | migrate 报 no pg_hba.conf entry | `pg_hba.conf` 少了 172.16.0.0/12 那行，或加在了 reject 之后 |
 | migrate 报 permission denied to create extension | 扩展没预建 —— 回 2.3② 以超级用户建 `vector` / `pgcrypto` |
 | 回滚报「本机已经没有 xxx 的镜像」 | 旧镜像被 prune 或手动清掉了。只能人工修，或直接重跑一次部署 |
+| 手动 up/recreate 报 `pull access denied` 后开始 Building，再报 `lstat .../docker: no such file` | `IMAGE_TAG` 落在了 `dev`：显式带 `IMAGE_TAG=$(cat .deployed-tag)`，或跑一次 Deploy 让它把 tag 写回 .env |
+| `docker compose` 刷一屏 `variable is not set` 警告 | `.env` 里有值含 `$` 且没加单引号（典型是 INVITE_CODE_HASH）——正是登录 500 那个坑 |
 
 ---
 

@@ -111,8 +111,18 @@ jobs:
 
       - name: 记录本次已知良好的 tag
         run: |
+          set -eu
           cd "$DEPLOY_DIR"
           echo "$IMAGE_TAG" > .deployed-tag
+          # 同时写进 .env：让人工手敲的 docker compose 命令（up / run / ps）
+          # 默认就指向当前在线的版本。不写的话 .env 里残留的 IMAGE_TAG=dev 会让
+          # compose 去找不存在的 :dev 镜像，进而在没有源码的生产目录里试图构建。
+          # 部署与回滚不受影响：workflow 的进程环境变量优先于 .env 文件。
+          if grep -q '^IMAGE_TAG=' .env; then
+            sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=$IMAGE_TAG|" .env
+          else
+            echo "IMAGE_TAG=$IMAGE_TAG" >> .env
+          fi
           echo "已部署 $IMAGE_TAG"
 
       # 只在「已经动过运行中的容器」之后才回滚。

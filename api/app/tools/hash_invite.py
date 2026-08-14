@@ -22,7 +22,11 @@ def main() -> int:
     if code != getpass.getpass("再输一次: "):
         print("两次输入不一致", file=sys.stderr)
         return 1
-    print(hash_invite_code(code))
+    # 直接输出可整行粘贴进 .env 的形式。单引号必不可少：argon2 hash 里全是 $，
+    # docker compose 读 .env 时会把 $argon2id / $v / $m 当变量引用替换成空串，
+    # 塞给容器一个被啃烂的 hash —— 登录会 500。单引号让 compose 和
+    # pydantic-settings 都按字面处理。
+    print(f"INVITE_CODE_HASH='{hash_invite_code(code)}'")
     return 0
 
 
