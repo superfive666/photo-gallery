@@ -52,6 +52,8 @@ members = ["libs", "api", "jobs", "embedding"]
 dev = [
     "ruff>=0.8.4",
     "mypy>=1.14",
+    # bs4 没带 py.typed，mypy --strict 需要 stubs
+    "types-beautifulsoup4>=4.12",
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     # api/jobs 的测试要 import 到这三个成员的代码
@@ -89,6 +91,8 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "**/tests/**" = ["S105", "S106"]
+# 样例 HTML 从真实相册页原样复制（回归的意义就在原样），不折行
+"jobs/tests/test_static_gallery.py" = ["E501"]
 
 [tool.ruff.lint.isort]
 # 否则 `api` / `jobs` / `gallery_core` 会被当成第三方包，import 分组混乱

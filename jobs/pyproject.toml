@@ -8,7 +8,8 @@ dependencies = [
     "gallery-core[db]",
     # 缩略图生成（源站没提供时）
     "pillow>=11.1",
-    # 解析源站相册页
+    # 解析源站相册页：bs4 做接口，lxml 做后端解析器
+    "beautifulsoup4>=4.12",
     "lxml>=5.3",
     # jobs/eval.py 直接调用 api 里那份真实的检索函数，见 docs/architecture.md 第 6 节
     "api",

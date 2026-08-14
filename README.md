@@ -130,8 +130,6 @@ EMBEDDING_USE_GPU=true
 - **误报无法归零。** 阈值是 precision/recall 的权衡，调高会漏、调低会串人。阈值标定方法见
   [`docs/evaluation.md`](docs/evaluation.md)。
 - **视频当前不处理**（只登记不提取），见 `docs/plans/`。
-- **相册页解析目前是通用实现。** 源站的确切标记结构还没确认，`jobs probe` 用于验证；
-  见 [`docs/data-source.md`](docs/data-source.md)。
 
 ---
 
