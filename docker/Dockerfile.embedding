@@ -58,7 +58,9 @@ ENV PATH="/app/.venv/bin:$PATH" \
 #   NEEDED： libcublas(Lt).so.13  libcudart.so.13  libcurand.so.10
 #   dlopen： libcudnn.so  libnvrtc.so.13
 # （libcuda.so.1 是驱动，运行时由 nvidia-container-toolkit 注入，不装。）
-# 代价：镜像大约 +1.5GB。ORT 升级到新 CUDA 大版本时，把 cu13 后缀跟着换。
+# CUDA 13 的轮子统一装进 site-packages/nvidia/cu13/lib（cu12 时代是
+# nvidia/<包名>/lib），下面的 nvidia/*/lib glob 对两种布局都成立。
+# 代价：镜像大约 +1.5GB。ORT 升级到新 CUDA 大版本时，跟着换下面的版本约束。
 #
 # 还需要：宿主机装好 NVIDIA 驱动（CUDA 13 系需要 ≥580）与 nvidia container
 # runtime，compose 里给 embedding 加 gpus，并设 EMBEDDING_USE_GPU=true。
@@ -70,12 +72,17 @@ RUN if [ "$EMBEDDING_GPU" = "true" ]; then \
         ORT_VER="$(uv pip show onnxruntime | awk '/^Version:/{print $2}')"; \
         echo "替换 onnxruntime ${ORT_VER} → onnxruntime-gpu ${ORT_VER}"; \
         uv pip uninstall onnxruntime; \
+        # ⚠️ 包名有坑：CUDA 13 起 NVIDIA 去掉了 -cu13 后缀（nvidia-cublas 13.x、
+        # nvidia-cuda-runtime 13.x、nvidia-curand 10.x —— curand 按自己的 so 版本号走），
+        # 只有 cuDNN 例外仍叫 nvidia-cudnn-cu13。而 PyPI 上 nvidia-cublas-cu13 之类
+        # 带后缀的名字全是 0.0.1 的占位空包，装它会在 sdist 构建阶段直接炸
+        # （首次真机构建就中过）。大版本钉死以匹配 ORT 1.28 要的 soname。
         uv pip install "onnxruntime-gpu==${ORT_VER}" \
-            nvidia-cublas-cu13 \
-            nvidia-cuda-runtime-cu13 \
-            nvidia-curand-cu13 \
-            nvidia-cudnn-cu13 \
-            nvidia-cuda-nvrtc-cu13; \
+            "nvidia-cublas>=13,<14" \
+            "nvidia-cuda-runtime>=13,<14" \
+            "nvidia-curand>=10,<11" \
+            "nvidia-cudnn-cu13>=9,<10" \
+            "nvidia-cuda-nvrtc>=13,<14"; \
         SITE="/app/.venv/lib/python3.11/site-packages"; \
         # 让动态链接器能找到 pip 装进 site-packages 的 CUDA 库
         ls -d "$SITE"/nvidia/*/lib > /etc/ld.so.conf.d/zz-nvidia-pip.conf; \
