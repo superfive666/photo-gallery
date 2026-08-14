@@ -297,7 +297,9 @@ POSTGRES_PASSWORD=<随机>
 DATABASE_URL=postgresql+asyncpg://gallery:<同上>@db:5432/photo_gallery
 JWT_SECRET=<随机>
 AUDIT_HASH_SALT=<随机>
-INVITE_CODE_HASH=<见下>
+# ⚠️ 必须整体用单引号包住 —— hash 里全是 $，不加引号会被 compose 插值啃烂，
+# 登录直接 500。hash_invite 工具输出的就是带引号的整行，原样粘贴。
+INVITE_CODE_HASH='<见下>'
 
 # 这台机器有 GPU：叠加 GPU 层 + 打开运行时开关
 COMPOSE_FILE=docker-compose.yml:docker-compose.gpu.yml
@@ -561,7 +563,8 @@ cd /opt/photo-gallery && docker compose logs -f --tail=100 api
 | 构建时一堆 `variable is not set` warning | 没带 `--env-file /opt/photo-gallery/.env` |
 | `/healthz` 里 `gpu: false` | 镜像不是 `EMBEDDING_GPU=true` 构建的；或 `.env` 少了 `EMBEDDING_USE_GPU=true`；或 `.env` 少了 `COMPOSE_FILE=...gpu.yml`（容器没挂到卡） |
 | `batch_supported: false` | 识别模型 ONNX 的 batch 维是固定 1，批量退化为逐张。需要换一份动态 batch 导出 |
-| 服务起来了但登录说邀请码错 | `INVITE_CODE_HASH` 抄漏了字符，或生成时用的明文不是分发出去的那个 |
+| 服务起来了但登录说邀请码错（401） | `INVITE_CODE_HASH` 抄漏了字符，或生成时用的明文不是分发出去的那个 |
+| 登录直接 500 | `INVITE_CODE_HASH` 没用单引号包住，`$argon2id` 等被 compose 当变量啃掉了；`docker compose logs api` 里会有 `invite_code_hash_invalid` |
 | 第二次部署后连不上数据库 | `.env` 被 `git clean` 删过 —— 确认它在 `/opt/photo-gallery` 而不是 runner 工作区 |
 | 一个人搜几次全站就被限流 | `real_ip` 没生效或 8080 被暴露，所有请求的来源 IP 塌成了同一个 |
 | `ingest` 跑完 0 张入库 | 相册页解析没收敛，先跑 `jobs probe`（见 [`data-source.md`](data-source.md)） |
