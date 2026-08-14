@@ -27,8 +27,9 @@
 代价是构建的磁盘和 CPU 开销落在 GPU 机上，靠每次部署后的
 `docker image prune --filter until=168h` 控制。
 
-版本靠 tag 区分（`photo-gallery-api:sha-abc1234`），**回滚 = 换个 tag 重新 up**，
-因为上一个版本的镜像还在本机。所以那个一周的保留窗口就是回滚能力的唯一来源，别调短。
+版本靠 tag 区分（`photo-gallery-api:sha-abc1234`），**回滚 = 换个 tag 重新 up**。
+镜像按数量保留：本机永远留两套 —— 当前在线（`.deployed-tag`）与上一个
+（`.previous-tag`，回滚目标），更早的在每次部署后自动删除。
 
 ---
 
@@ -333,7 +334,8 @@ sudo install -d -o postgres -g postgres -m 750 /srv/backups
 | `.env` | **人手动放，只放一次** | 600 权限，永不进 git，永不经过 GitHub |
 | `docker-compose.yml` / `docker-compose.gpu.yml` | deploy workflow 同步 | |
 | `docs/schema/*.sql` | deploy workflow 同步 | `jobs` 容器挂载它做迁移 |
-| `.deployed-tag` | deploy workflow 写 | 上一次健康检查通过的镜像 tag，回滚就靠它 |
+| `.deployed-tag` | deploy workflow 写 | 当前在线的镜像 tag，回滚就靠它 |
+| `.previous-tag` | deploy workflow 写 | 上一个在线版本，清理镜像时保留的第二套 |
 
 > ⚠️ **绝不要把 `.env` 放在 runner 的工作区里**（`~ghrunner/_work/...`）。
 > `actions/checkout` 会执行 `git clean -ffdx`，连 gitignore 的文件一起删 ——
@@ -603,11 +605,12 @@ docker system df
 du -sh /var/lib/docker
 ```
 
-deploy workflow 每次结束都跑 `docker image prune -f --filter until=168h`。
-**别把这个窗口调短**：没有镜像仓库可拉，本机保留的旧镜像就是回滚能力的唯一来源。
+每次部署结束自动清理：**只保留两套镜像** —— 当前在线与上一个（回滚目标），
+更早的 tag 直接删；悬空层清掉；buildkit 构建缓存上限 20GB（CUDA 轮子与模型权重的
+缓存层别清，它们是「改业务代码构建只要几十秒」的原因）。
+GPU 版 embedding 镜像单个约 5.5GB，两套 + 缓存的稳态占用约 35GB。
 
-手工清理时用 `docker image prune`（只删悬空层），**别用 `docker system prune -a`**
-—— 那会把还能用于回滚的旧版本镜像一起删掉。
+手工清理时**别用 `docker system prune -a`** —— 那会把回滚要用的上一版镜像一起删掉。
 
 ### 看日志
 
