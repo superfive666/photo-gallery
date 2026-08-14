@@ -113,6 +113,10 @@ jobs:
         run: |
           set -eu
           cd "$DEPLOY_DIR"
+          # 上一个在线版本是回滚目标，记下来供清理步骤保留
+          if [ -f .deployed-tag ] && [ "$(cat .deployed-tag)" != "$IMAGE_TAG" ]; then
+            cp .deployed-tag .previous-tag
+          fi
           echo "$IMAGE_TAG" > .deployed-tag
           # 同时写进 .env：让人工手敲的 docker compose 命令（up / run / ps）
           # 默认就指向当前在线的版本。不写的话 .env 里残留的 IMAGE_TAG=dev 会让
@@ -150,9 +154,30 @@ jobs:
           # 无论回滚是否成功，这次部署都算失败
           exit 1
 
-      - name: 清理悬空镜像
+      # ⚠️ 不能用 `docker image prune --filter until=…`：它只删「悬空（无 tag）」
+      # 镜像，带 sha- tag 的旧版本一个都不会碰 —— embedding 单个 5.5GB，
+      # 堆几次部署磁盘就满了（生产上真堆出过 3 份）。改为按数量保留：
+      # 只留当前在线（.deployed-tag）与上一个（.previous-tag，回滚目标）。
+      - name: 清理旧版本镜像
         if: always()
-        # 家用机器磁盘有限，构建也在这台机器上，每次部署都会留下旧镜像层。
-        # until=168h：保证至少一周内的版本还能直接换 tag 回滚 —— 没有仓库可拉，
-        # 这个保留窗口就是回滚能力的唯一来源，别调短。
-        run: docker image prune -f --filter "until=168h"
+        run: |
+          set -eu
+          cd "$DEPLOY_DIR"
+          keep1="$(cat .deployed-tag 2>/dev/null || true)"
+          keep2="$(cat .previous-tag 2>/dev/null || true)"
+          echo "保留: $keep1 $keep2"
+          for svc in api jobs web embedding; do
+            docker images --format '{{.Repository}}:{{.Tag}}' "$IMAGE_PREFIX-$svc" \
+            | while read -r img; do
+                tag="${img##*:}"
+                case "$tag" in "<none>"|"$keep1"|"$keep2") continue ;; esac
+                # 正被容器使用的镜像 rmi 会拒绝删除，跳过即可
+                docker rmi "$img" >/dev/null 2>&1 && echo "已删除 $img" || echo "跳过 $img（使用中）"
+              done
+          done
+          # 重建同名 tag 时旧层会变成悬空镜像，一并清掉
+          docker image prune -f >/dev/null
+          # buildkit 构建缓存单独设上限。别清太狠：CUDA 轮子与模型权重的缓存层
+          # 正是「改业务代码时构建只要几十秒而不是二十分钟」的原因。
+          docker builder prune -f --keep-storage 20g >/dev/null 2>&1 || true
+          docker system df

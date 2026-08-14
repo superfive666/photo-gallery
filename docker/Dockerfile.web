@@ -24,5 +24,8 @@ COPY --from=build /app/dist /usr/share/nginx/html
 
 EXPOSE 80
 
+# 用 127.0.0.1 而不是 localhost：alpine 里 localhost 会先解析到 IPv6 的 ::1，
+# 而 nginx 只 listen 了 IPv4 —— busybox wget 连 ::1 被拒后不会回退，
+# 健康检查会一直失败（服务本身完全正常，纯探活误报）。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
-    CMD wget -q --spider http://localhost/ || exit 1
+    CMD wget -q --spider http://127.0.0.1/ || exit 1

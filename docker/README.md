@@ -67,6 +67,13 @@ echo "EMBEDDING_USE_GPU=true" >> .env
 ⚠️ 这一步**有意步出了 uv.lock**：onnxruntime 与 onnxruntime-gpu 提供同一个模块，
 而 insightface 硬依赖前者，没法用互斥 extra 干净地二选一。GPU 版的版本号是从已锁定的
 CPU 版读出来的，所以两者始终一致，不需要另外维护一个常量。
+
+GPU 构建还会装齐 CUDA 运行时轮子（cublas / cudart / curand / cudnn / nvrtc，
+约 +1.5GB）：onnxruntime-gpu 自己不带这些库，nvidia-container-toolkit 也只注入
+驱动。缺库时 onnxruntime **不报错，静默退回 CPU** —— 首次上线就中过这个招。
+两道防线：构建期 ldd 校验 CUDA provider 的依赖齐全（缺了直接构建失败）；
+运行期 `EMBEDDING_USE_GPU=true` 而 CUDA provider 未生效时服务拒绝启动，
+让健康检查当场失败并触发回滚。
 详见 `docker/Dockerfile.embedding` 里那段注释与 `embedding/pyproject.toml`。
 
 还需要：

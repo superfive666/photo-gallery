@@ -147,9 +147,11 @@ on:
   以后要引入仓库（GHCR / Docker Hub / 内网 registry）只改 `IMAGE_PREFIX` 一个变量。
 - Tag 规则：`sha-<short>`，每次部署一个。**不用 `latest`** —— 都叫 latest 就没法回滚。
   定时 ingest 读 `.deployed-tag`，跑的是当前在线的那个版本。
-- 回滚就是换 tag 重新 `up`。前提是旧镜像还在本机，所以
-  `docker image prune --filter until=168h` 的窗口别调短，也别用
-  `docker system prune -a`（会连可回滚的旧版本一起删）。
+- 回滚就是换 tag 重新 `up`。本机按数量保留两套镜像：当前在线 + 上一个
+  （`.deployed-tag` / `.previous-tag`），更早的在每次部署后自动删除。
+  ⚠️ 不能靠 `docker image prune --filter until=…` 清旧版本 —— 它只删悬空镜像，
+  带 tag 的一个都不会碰（生产上真堆出过 3 份 5.5GB 的 embedding）。
+  手工也别用 `docker system prune -a`（会连回滚目标一起删）。
 - `embedding` 镜像含模型权重（约 +300MB），只在 `embedding/`、`uv.lock` 或模型版本
   变化时重建 —— 用 `paths` 过滤避免每次 PR 都重建它。
 - 依赖变更由 `uv.lock` 唯一决定，所以「同一个 commit 构建出的镜像装的是同一批版本」

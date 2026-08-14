@@ -27,8 +27,9 @@
 代价是构建的磁盘和 CPU 开销落在 GPU 机上，靠每次部署后的
 `docker image prune --filter until=168h` 控制。
 
-版本靠 tag 区分（`photo-gallery-api:sha-abc1234`），**回滚 = 换个 tag 重新 up**，
-因为上一个版本的镜像还在本机。所以那个一周的保留窗口就是回滚能力的唯一来源，别调短。
+版本靠 tag 区分（`photo-gallery-api:sha-abc1234`），**回滚 = 换个 tag 重新 up**。
+镜像按数量保留：本机永远留两套 —— 当前在线（`.deployed-tag`）与上一个
+（`.previous-tag`，回滚目标），更早的在每次部署后自动删除。
 
 ---
 
@@ -333,7 +334,8 @@ sudo install -d -o postgres -g postgres -m 750 /srv/backups
 | `.env` | **人手动放，只放一次** | 600 权限，永不进 git，永不经过 GitHub |
 | `docker-compose.yml` / `docker-compose.gpu.yml` | deploy workflow 同步 | |
 | `docs/schema/*.sql` | deploy workflow 同步 | `jobs` 容器挂载它做迁移 |
-| `.deployed-tag` | deploy workflow 写 | 上一次健康检查通过的镜像 tag，回滚就靠它 |
+| `.deployed-tag` | deploy workflow 写 | 当前在线的镜像 tag，回滚就靠它 |
+| `.previous-tag` | deploy workflow 写 | 上一个在线版本，清理镜像时保留的第二套 |
 
 > ⚠️ **绝不要把 `.env` 放在 runner 的工作区里**（`~ghrunner/_work/...`）。
 > `actions/checkout` 会执行 `git clean -ffdx`，连 gitignore 的文件一起删 ——
@@ -603,11 +605,12 @@ docker system df
 du -sh /var/lib/docker
 ```
 
-deploy workflow 每次结束都跑 `docker image prune -f --filter until=168h`。
-**别把这个窗口调短**：没有镜像仓库可拉，本机保留的旧镜像就是回滚能力的唯一来源。
+每次部署结束自动清理：**只保留两套镜像** —— 当前在线与上一个（回滚目标），
+更早的 tag 直接删；悬空层清掉；buildkit 构建缓存上限 20GB（CUDA 轮子与模型权重的
+缓存层别清，它们是「改业务代码构建只要几十秒」的原因）。
+GPU 版 embedding 镜像单个约 5.5GB，两套 + 缓存的稳态占用约 35GB。
 
-手工清理时用 `docker image prune`（只删悬空层），**别用 `docker system prune -a`**
-—— 那会把还能用于回滚的旧版本镜像一起删掉。
+手工清理时**别用 `docker system prune -a`** —— 那会把回滚要用的上一版镜像一起删掉。
 
 ### 看日志
 
@@ -637,12 +640,15 @@ cd /opt/photo-gallery && docker compose logs -f --tail=100 api
 | `config.sh` 报 token 无效 | 注册 token 只有 1 小时有效期，回网页重新拿一个 |
 | workflow 里 `docker` 报 permission denied | `ghrunner` 没加进 `docker` 组，或加完没重启 runner 服务 |
 | 构建时一堆 `variable is not set` warning | 没带 `--env-file /opt/photo-gallery/.env` |
-| `/healthz` 里 `gpu: false` | 镜像不是 `EMBEDDING_GPU=true` 构建的；或 `.env` 少了 `EMBEDDING_USE_GPU=true`；或 `.env` 少了 `COMPOSE_FILE=...gpu.yml`（容器没挂到卡） |
+| embedding 起不来，日志报 `CUDA provider 未生效` | 这是**有意的拒绝启动**（不再静默退回 CPU）。按报错里的排查顺序：onnxruntime 缺库日志 → 镜像是否 GPU 构建 → 驱动 ≥580 → 是否叠加 gpu.yml |
+| embedding 日志有 `Failed to load library ... libcublasLt` | 旧版镜像缺 CUDA 运行时库 —— 重新部署即可，新构建会装齐并在构建期校验 |
+| `/healthz` 里 `gpu: false` 但没报错 | `.env` 少了 `EMBEDDING_USE_GPU=true`（这属于「没要求 GPU」，不触发拒绝启动） |
 | `batch_supported: false` | 识别模型 ONNX 的 batch 维是固定 1，批量退化为逐张。需要换一份动态 batch 导出 |
 | 服务起来了但登录说邀请码错（401） | `INVITE_CODE_HASH` 抄漏了字符，或生成时用的明文不是分发出去的那个 |
 | 登录直接 500 | `INVITE_CODE_HASH` 没用单引号包住，`$argon2id` 等被 compose 当变量啃掉了；`docker compose logs api` 里会有 `invite_code_hash_invalid` |
 | 第二次部署后连不上数据库 | `.env` 被 `git clean` 删过 —— 确认它在 `/opt/photo-gallery` 而不是 runner 工作区 |
 | 一个人搜几次全站就被限流 | `real_ip` 没生效或 8080 被暴露，所有请求的来源 IP 塌成了同一个 |
+| web 容器 unhealthy 但页面正常 | 旧镜像的探活用 `localhost`（在 alpine 里先解析成 ::1，nginx 只听 IPv4）——纯误报，重新部署即可 |
 | `ingest` 跑完 0 张入库 | 相册页解析没收敛，先跑 `jobs probe`（见 [`data-source.md`](data-source.md)） |
 | migrate 报 connection refused | pg 只听 localhost（`listen_addresses`），或 ufw 没放行 docker 网段（2.3③ / 2.7） |
 | migrate 报 no pg_hba.conf entry | `pg_hba.conf` 少了 172.16.0.0/12 那行，或加在了 reject 之后 |
