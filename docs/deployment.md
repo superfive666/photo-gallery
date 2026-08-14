@@ -379,6 +379,9 @@ REC_BATCH_SIZE=128
 # 前面有宿主机反向代理，端口只对本机开
 WEB_BIND=127.0.0.1
 WEB_PORT=8080
+# ⚠️ 还没上 HTTPS、用 http://<内网IP>:8080 直测时，这一项必须 false ——
+# 否则浏览器拒收 Secure cookie（登录 200 但一切后续请求 401）。上 Caddy 后改回 true。
+SESSION_COOKIE_SECURE=false
 
 # jobs 容器的挂载点要真实存在，否则 docker 会建出 root 属主的空目录
 SOURCE_LOCAL_DIR=/opt/photo-gallery/data/sample-albums
@@ -645,6 +648,7 @@ cd /opt/photo-gallery && docker compose logs -f --tail=100 api
 | `/healthz` 里 `gpu: false` 但没报错 | `.env` 少了 `EMBEDDING_USE_GPU=true`（这属于「没要求 GPU」，不触发拒绝启动） |
 | `batch_supported: false` | 识别模型 ONNX 的 batch 维是固定 1，批量退化为逐张。需要换一份动态 batch 导出 |
 | 服务起来了但登录说邀请码错（401） | `INVITE_CODE_HASH` 抄漏了字符，或生成时用的明文不是分发出去的那个 |
+| 登录成功（200）但之后所有 /api 都 401 | 走 http 直测但 `SESSION_COOKIE_SECURE` 还是 true，浏览器拒收 Secure cookie；设 false 并重建 api（上 HTTPS 后改回 true） |
 | 登录直接 500 | `INVITE_CODE_HASH` 没用单引号包住，`$argon2id` 等被 compose 当变量啃掉了；`docker compose logs api` 里会有 `invite_code_hash_invalid` |
 | 第二次部署后连不上数据库 | `.env` 被 `git clean` 删过 —— 确认它在 `/opt/photo-gallery` 而不是 runner 工作区 |
 | 一个人搜几次全站就被限流 | `real_ip` 没生效或 8080 被暴露，所有请求的来源 IP 塌成了同一个 |

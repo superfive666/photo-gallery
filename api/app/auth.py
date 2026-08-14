@@ -73,8 +73,9 @@ def issue_session(response: Response, settings: Settings) -> str:
         token,
         max_age=settings.session_ttl_hours * 3600,
         httponly=True,
-        # 生产环境必须是 True。本地 http 调试时由 .env 覆盖。
-        secure=True,
+        # HTTPS 环境必须是 True；内网 http 直测阶段用 SESSION_COOKIE_SECURE=false
+        # 关掉，否则浏览器拒收 Secure cookie（登录 200 但 session 存不下来 → 全线 401）
+        secure=settings.session_cookie_secure,
         samesite="lax",
         path="/",
     )
