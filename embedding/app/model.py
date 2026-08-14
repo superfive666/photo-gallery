@@ -140,16 +140,16 @@ class FaceExtractor:
 
         actual_providers = list(getattr(app.det_model.session, "get_providers", list)())
         if self._use_gpu and "CUDAExecutionProvider" not in actual_providers:
+            probe = _probe_cuda_runtime_libs()
             # 宁可启动失败也不静默降级。onnxruntime 在 CUDA provider 加载失败时
             # 只打一条日志就退回 CPU 继续跑，容器照样 healthy —— 那种「一切正常、
             # 只是慢十倍」的状态比崩溃难发现得多（首次上线时 GPU 机就这样跑了
             # 十小时 CPU 推理）。这里抛错让健康检查失败，部署会自动回滚并留下明确记录。
             raise RuntimeError(
                 f"EMBEDDING_USE_GPU=true 但 CUDA provider 未生效（实际: {actual_providers}）。"
-                "排查顺序：①容器启动日志里 onnxruntime 的报错，缺库会写明少哪个 .so；"
-                "②镜像是否以 EMBEDDING_GPU=true 构建；"
+                "排查顺序：①下面的逐库探测结果；②镜像是否以 EMBEDDING_GPU=true 构建；"
                 "③nvidia-smi 驱动版本是否满足 CUDA 13（≥580）；"
-                "④compose 是否叠加了 gpu.yml（容器要挂到卡）。"
+                f"④compose 是否叠加了 gpu.yml（容器要挂到卡）。逐库探测：{probe}"
             )
 
         self._app = app
@@ -367,3 +367,30 @@ class FaceExtractor:
             # convert 会丢掉全部 EXIF（含 GPS）。自拍的元数据不该进入后续任何环节。
             arr = np.asarray(oriented.convert("RGB"), dtype=np.uint8)
         return arr, arr.shape[1], arr.shape[0]
+
+
+def _probe_cuda_runtime_libs() -> str:
+    """逐个 dlopen CUDA 运行时库，报告哪个加载失败。
+
+    只在「要求 GPU 但 CUDA provider 未生效」的报错路径上调用 —— onnxruntime 对
+    加载失败只给一条一次性的 stderr 日志，这里的结果让报错自带定位信息。
+    soname 清单对应 onnxruntime-gpu 1.28（见 docker/Dockerfile.embedding 的注释）。
+    """
+    import ctypes
+
+    parts: list[str] = []
+    for name in (
+        "libcuda.so.1",
+        "libcublasLt.so.13",
+        "libcublas.so.13",
+        "libcudart.so.13",
+        "libcurand.so.10",
+        "libcudnn.so.9",
+        "libnvrtc.so.13",
+    ):
+        try:
+            ctypes.CDLL(name)
+            parts.append(f"{name}:OK")
+        except OSError as exc:
+            parts.append(f"{name}:FAIL({exc})")
+    return " ".join(parts)
