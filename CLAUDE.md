@@ -94,10 +94,10 @@ make eval          # 跑阈值评估集，输出 precision/recall
 
 ## 当前未决问题
 
-- **photos.zrc.sg 的相册页标记结构未确认。** 站点本身已确认是公开无鉴权、
-  地址形如 `/album/<slug>`。`static_gallery.py` 里现在是按优先级依次尝试的通用解析
-  （JSON 索引 → `<a href>` → `<img src>`）。
-  **下一步跑 `make probe ALBUM=2026-08-10`**，拿到真实输出后收敛成精确选择器。
-  详见 [`docs/data-source.md`](docs/data-source.md)。
+- ~~photos.zrc.sg 的相册页标记结构未确认~~ **已确认并收敛**（2026-08-14）：
+  每个媒体项是带 `data-lightbox` 的 div，字段全在 data-* 属性里
+  （`data-original-src` / `data-thumb` / `data-is-video`）。解析用 bs4，
+  见 `jobs/sources/static_gallery.py` 的模块 docstring。
+  仍未确认的只剩**相册索引页**结构（影响不带 --album 的全量 ingest）。
 - 相似度阈值需要用真实数据标定，当前默认值只是文献经验值。见 `docs/evaluation.md`。
 - `SEARCH_CANDIDATES`（默认 500）是召回上限，尚未用真实数据验证是否够用。

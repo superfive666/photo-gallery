@@ -1,26 +1,29 @@
 """photos.zrc.sg —— 公开的静态照片墙 adapter。
 
-## 已确认
+## 页面结构（2026-08-14 以真实相册页确认，此前的通用猜测式解析已删除）
 
-- 站点公开，无需鉴权。
-- 相册地址：`{SOURCE_BASE_URL}/album/{slug}`，例如 `https://photos.zrc.sg/album/2026-08-10`。
-- 相册里同时有照片和视频。
+相册页 `{SOURCE_BASE_URL}/album/{slug}` 返回服务端渲染的 HTML，每个媒体项是
+一个带 `data-lightbox` 属性的 `<div>`（站点自己的 ZephyrLightbox 组件），
+全部信息都在 data-* 属性里：
 
-## 仍未确认（决定 `_parse_album_page` 的最终形态）
+    <div class="group relative ..." data-lightbox
+         data-id="20260812215627863"
+         data-src="/album/2026-08-12/20260812215627863.mp4"
+         data-original-src="/album/2026-08-12/20260812215627863.mp4"
+         data-thumb="/album/thumb/2026-08-12/20260812215627863.mp4"
+         data-is-video="true"
+         data-uploader="Stone" ...>
 
-相册页的具体标记结构。所以这里实现的是**按优先级依次尝试**的通用解析：
+映射关系：
+    photo_url     ← data-original-src（缺失时退回 data-src）
+    thumbnail_url ← data-thumb
+    kind          ← data-is-video（"true" → video；另用扩展名兜底）
+视频照常产出（kind="video"）—— pipeline 对视频只登记不提取，这是既有语义。
 
-1. `/album/{slug}/index.json`、`/album/{slug}.json`、`?format=json` —— 若站点有结构化索引，
-   优先用它，比解析 HTML 稳定得多。
-2. HTML：抓 `<a href>` 里指向图片/视频后缀的链接作为原图，抓同一元素内的 `<img src>`
-   作为缩略图；再兜底扫全页的 `<img src>`。
+页面上找不到任何 data-lightbox 节点视为**页面结构变更**，打 error 日志并返回空，
+让 ingest 报告的 0 计数把问题暴露出来，而不是退回猜测式解析给出错误结果。
 
-**先用 `jobs probe --album <slug>` 对着真站跑一次**，它会打印解析到的结构和样例条目。
-拿到实际输出后再把这里收敛成精确的选择器 —— 通用解析只是让工作能立刻推进，
-不是最终形态。
-
-抓取纪律（无论最终解析怎么写都要遵守）：限速、并发上限、指数退避、可识别 UA、
-流式下载、单张失败不中断整批。
+抓取纪律：限速、并发上限、指数退避、可识别 UA、流式下载、单张失败不中断整批。
 """
 
 from __future__ import annotations
@@ -29,11 +32,11 @@ import asyncio
 import posixpath
 import time
 from collections.abc import AsyncIterator
-from typing import Any
 from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
-from lxml import html as lxml_html
+from bs4 import BeautifulSoup
+from bs4.element import Tag
 
 from gallery_core.logging import get_logger
 from jobs.sources.base import SourceAsset
@@ -44,11 +47,6 @@ _CHUNK = 256 * 1024
 
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".avif"}
 _VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".avi"}
-
-# 常见的缩略图路径特征。命中这些的链接不会被当成原图。
-_THUMB_HINTS = ("thumb", "thumbnail", "small", "preview", "_t.", "/tn/", "resized")
-
-_JSON_CANDIDATES = ("index.json", "album.json")
 
 
 class RateLimiter:
@@ -81,11 +79,6 @@ def _kind_of(url: str) -> str | None:
     if suffix in _VIDEO_SUFFIXES:
         return "video"
     return None
-
-
-def _looks_like_thumbnail(url: str) -> bool:
-    lowered = url.lower()
-    return any(hint in lowered for hint in _THUMB_HINTS)
 
 
 class StaticGalleryAdapter:
@@ -156,14 +149,11 @@ class StaticGalleryAdapter:
 
             slugs: list[str] = []
             seen: set[str] = set()
-            try:
-                tree = lxml_html.fromstring(resp.text)
-            # 这个候选路径返回的不是 HTML 就换下一个，不是错误。
-            except Exception as exc:
-                log.debug("album_index_unparsable", path=path, error_type=type(exc).__name__)
-                continue
-            for href in tree.xpath("//a/@href"):
-                slug = self._slug_from_href(str(href))
+            soup = BeautifulSoup(resp.text, "lxml")
+            for anchor in soup.find_all("a", href=True):
+                if not isinstance(anchor, Tag):
+                    continue
+                slug = self._slug_from_href(str(anchor["href"]))
                 if slug and slug not in seen:
                     seen.add(slug)
                     slugs.append(slug)
@@ -203,127 +193,51 @@ class StaticGalleryAdapter:
             yield asset
 
     async def _collect_assets(self, album: str) -> list[SourceAsset]:
-        json_assets = await self._try_json_index(album)
-        if json_assets is not None:
-            log.info("album_parsed", album=album, via="json", count=len(json_assets))
-            return json_assets
-
         page_url = self.album_url(album)
         resp = await self._get(page_url)
         resp.raise_for_status()
         assets = self._parse_album_page(album, page_url, resp.text)
-        log.info("album_parsed", album=album, via="html", count=len(assets))
-        return assets
-
-    async def _try_json_index(self, album: str) -> list[SourceAsset] | None:
-        """如果站点提供 JSON 索引就用它 —— 比解析 HTML 稳定得多。"""
-        candidates = [f"/album/{album}/{name}" for name in _JSON_CANDIDATES]
-        candidates.append(f"/album/{album}?format=json")
-
-        for path in candidates:
-            try:
-                resp = await self._get(path)
-            except httpx.HTTPError:
-                continue
-            if resp.status_code != 200:
-                continue
-            if "json" not in resp.headers.get("content-type", "").lower():
-                continue
-            try:
-                payload = resp.json()
-            except ValueError:
-                continue
-
-            assets = self._parse_json_payload(album, str(resp.url), payload)
-            if assets:
-                return assets
-        return None
-
-    def _parse_json_payload(self, album: str, base: str, payload: Any) -> list[SourceAsset]:
-        """从 JSON 索引里抽资产。
-
-        字段名未知，所以对常见命名做兼容。拿到真实结构后应收敛成精确读取。
-        """
-        items: Any = payload
-        if isinstance(payload, dict):
-            for key in ("items", "photos", "assets", "files", "data", "media"):
-                if isinstance(payload.get(key), list):
-                    items = payload[key]
-                    break
-        if not isinstance(items, list):
-            return []
-
-        assets: list[SourceAsset] = []
-        for item in items:
-            if isinstance(item, str):
-                url = urljoin(base, item)
-                thumb = None
-            elif isinstance(item, dict):
-                raw = _first_str(item, ("url", "src", "original", "full", "path", "file"))
-                if raw is None:
-                    continue
-                url = urljoin(base, raw)
-                raw_thumb = _first_str(item, ("thumbnail", "thumb", "preview", "small"))
-                thumb = urljoin(base, raw_thumb) if raw_thumb else None
-            else:
-                continue
-
-            kind = _kind_of(url)
-            if kind is None:
-                continue
-            assets.append(
-                SourceAsset(
-                    album=album,
-                    filename=posixpath.basename(unquote(urlparse(url).path)) or "unnamed",
-                    photo_url=url,
-                    kind=kind,  # type: ignore[arg-type]
-                    thumbnail_url=thumb,
-                )
-            )
+        log.info("album_parsed", album=album, count=len(assets))
         return assets
 
     def _parse_album_page(self, album: str, page_url: str, body: str) -> list[SourceAsset]:
-        """从相册 HTML 里抽资产。
+        """从相册 HTML 里抽资产。结构契约见模块 docstring。"""
+        soup = BeautifulSoup(body, "lxml")
+        nodes = soup.find_all(attrs={"data-lightbox": True})
 
-        策略：先看 `<a href>`（静态相册通常用链接指向原图，`<img>` 才是缩略图），
-        没有可用链接时退回扫 `<img src>`。命中缩略图特征的链接不会被当成原图。
-        """
-        tree = lxml_html.fromstring(body)
         assets: list[SourceAsset] = []
-
-        for anchor in tree.xpath("//a[@href]"):
-            href = urljoin(page_url, str(anchor.get("href")))
-            kind = _kind_of(href)
-            if kind is None or _looks_like_thumbnail(href):
+        for node in nodes:
+            if not isinstance(node, Tag):
                 continue
-            # 链接内部的 <img> 就是这张照片的缩略图
-            inner = anchor.xpath(".//img/@src")
-            thumb = urljoin(page_url, str(inner[0])) if inner else None
-            assets.append(
-                SourceAsset(
-                    album=album,
-                    filename=posixpath.basename(unquote(urlparse(href).path)) or "unnamed",
-                    photo_url=href,
-                    kind=kind,  # type: ignore[arg-type]
-                    thumbnail_url=thumb,
-                )
-            )
-
-        if assets:
-            return assets
-
-        # 兜底：页面直接把原图放在 <img src> 里
-        for src in tree.xpath("//img/@src"):
-            url = urljoin(page_url, str(src))
-            if _kind_of(url) != "image":
+            raw = _attr(node, "data-original-src") or _attr(node, "data-src")
+            if raw is None:
+                log.warning("lightbox_item_without_src", album=album, id=_attr(node, "data-id"))
                 continue
+            url = urljoin(page_url, raw)
+
+            # data-is-video 是权威来源；扩展名兜底（属性缺失或将来改名时仍能分对）
+            is_video = (_attr(node, "data-is-video") or "").strip().lower() == "true"
+            kind = "video" if is_video or _kind_of(url) == "video" else "image"
+
+            raw_thumb = _attr(node, "data-thumb")
             assets.append(
                 SourceAsset(
                     album=album,
                     filename=posixpath.basename(unquote(urlparse(url).path)) or "unnamed",
                     photo_url=url,
-                    kind="image",
+                    kind=kind,  # type: ignore[arg-type]
+                    thumbnail_url=urljoin(page_url, raw_thumb) if raw_thumb else None,
                 )
+            )
+
+        if not assets:
+            # 一个都没解析到 = 页面结构变了（或 slug 不存在）。宁可 0 计数报警，
+            # 也不退回猜测式解析给出「能跑但结果全错」。
+            log.error(
+                "album_page_no_lightbox_items",
+                album=album,
+                url=page_url,
+                hint="页面里没有 data-lightbox 节点。源站结构变更？用 jobs probe 核对。",
             )
         return assets
 
@@ -353,9 +267,6 @@ class StaticGalleryAdapter:
         return resp.content
 
 
-def _first_str(item: dict[str, Any], keys: tuple[str, ...]) -> str | None:
-    for key in keys:
-        value = item.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
+def _attr(node: Tag, name: str) -> str | None:
+    value = node.get(name)
+    return value if isinstance(value, str) and value else None

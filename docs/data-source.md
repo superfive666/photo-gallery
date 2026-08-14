@@ -20,42 +20,45 @@
 但**本站仍然需要邀请码**：人脸检索创造了一个源站本身没有的能力 —— 拿一张某人的照片
 就能把他在所有活动里的照片一次性聚齐。见 [`privacy.md`](privacy.md)。
 
-## 仍未确认
+## 相册页结构（2026-08-14 已确认，解析已收敛）
 
-**相册页的具体标记结构。** 这决定 `_parse_album_page` 的最终形态。
+相册页是服务端渲染的 HTML，每个媒体项是一个带 `data-lightbox` 属性的 `<div>`
+（站点自己的 ZephyrLightbox 组件），全部信息都在 data-* 属性里。真实样例（视频）：
 
-`jobs/sources/static_gallery.py` 现在实现的是按优先级依次尝试的通用解析：
-
-1. `/album/<slug>/index.json`、`/album/<slug>/album.json`、`?format=json`
-   —— 若站点有结构化索引，优先用它，比解析 HTML 稳定得多。
-2. HTML：抓 `<a href>` 里指向图片/视频后缀的链接作为原图，抓同一 `<a>` 内的
-   `<img src>` 作为缩略图；没有可用链接时兜底扫全页 `<img src>`。
-   命中 `thumb` / `small` / `preview` 等路径特征的链接不会被当成原图。
-
-### 下一步：跑一次 probe
-
-```bash
-make probe ALBUM=2026-08-10
+```html
+<div class="group relative aspect-[4/5] ..."
+     onclick="ZephyrLightbox.show('\/album\/2026-08-12\/20260812215627863.mp4', true, 'Stone', ...)"
+     data-thumb="/album/thumb/2026-08-12/20260812215627863.mp4"
+     data-id="20260812215627863" data-lightbox
+     data-src="/album/2026-08-12/20260812215627863.mp4"
+     data-is-video="true" data-uploader="Stone"
+     data-original-src="/album/2026-08-12/20260812215627863.mp4">
 ```
 
-它会打印解析到了多少相册、多少照片/视频、多少条带源站缩略图，以及前 5 条样例。
-**把这个输出（或相册页的 HTML 片段）贴出来**，就能把通用解析收敛成精确的选择器。
+映射（实现在 `jobs/sources/static_gallery.py`，用 bs4 选 `[data-lightbox]`）：
 
-如果输出是 `assets_total: 0`，说明通用解析没匹配上这个站点的结构 —— 这是预期内的，
-不是 bug。
+| SourceAsset 字段 | 来源 |
+| --- | --- |
+| `photo_url` | `data-original-src`（缺失时退回 `data-src`），urljoin 成绝对地址 |
+| `thumbnail_url` | `data-thumb` —— 源站为每个条目都提供缩略图（`/album/thumb/<slug>/<id>.<ext>`） |
+| `kind` | `data-is-video="true"` → video；属性缺失时按扩展名兜底 |
+| `filename` | URL path 的 basename（`<data-id>.<ext>`） |
 
-### 其余几个仍需确认的点
+视频照常产出（`kind="video"`）：pipeline 对视频**只登记不提取**（`reason="video"`），
+这就是「只用非视频文件建库」的实现点。
+
+页面上找不到任何 `data-lightbox` 节点时返回空并打 `album_page_no_lightbox_items`
+的 error 日志 —— 视为源站结构变更，宁可 0 计数报警也不猜。回归测试
+`jobs/tests/test_static_gallery.py` 用的就是上面那段原样 HTML。
+
+### 仍未确认的点
 
 1. **相册索引页**：有没有一个页面列出全部相册？`list_albums()` 会尝试
    `/album/`、`/albums`、`/`，都失败则返回空列表，此时必须用 `--album` 显式指定。
-2. **缩略图**：源站是否为每张照片提供缩略图？提供的话直接落其字节（省一次本地重编码）；
-   没有则由 `jobs/thumbnails.py` 从原图生成 256px WebP。
-   probe 输出里的 `with_source_thumbnail` 会告诉我们答案。
-3. **规模**：总照片数量级？这决定 `SEARCH_CANDIDATES`（默认 500，是召回上限）是否够用
+   （影响不带 `--album` 的全量 ingest 和每日定时增量。）
+2. **规模**：总照片数量级？这决定 `SEARCH_CANDIDATES`（默认 500，是召回上限）是否够用
    —— 单个成员在库里的照片数超过它，结果就会被截断。
-4. **视频占比**：第一期不处理视频，但需要知道量级来决定第二期优先级。
-   probe 输出里的 `videos` 会给出单个相册的情况。
-5. **变更检测**：当前策略是「这个 photo_url 成功入库过就跳过」。
+3. **变更检测**：当前策略是「这个 photo_url 成功入库过就跳过」。
    对追加式的照片墙够用；同一 URL 内容被替换的情况检测不到，需要时用 `--full`。
    如果源站响应带 `ETag`/`Last-Modified`，可以后续升级成 checksum 比对。
 
@@ -84,7 +87,7 @@ class SourceAsset:
 
 | 实现 | 状态 |
 | --- | --- |
-| `static_gallery.py` | 可用，但解析策略是通用的，待 probe 后收敛 |
+| `static_gallery.py` | **可用，解析已按真实页面结构收敛**（`[data-lightbox]` 契约） |
 | `local_dir.py` | 可用。扫描本地目录（一级子目录名 = album slug），用于开发和评估集 |
 
 ## 抓取纪律
