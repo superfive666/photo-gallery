@@ -51,7 +51,9 @@ def test_video_kept_as_video_kind() -> None:
     video = next(a for a in _parse(ALBUM_HTML) if a.filename.endswith(".mp4"))
     assert video.kind == "video"
     assert video.photo_url == "https://photos.zrc.sg/album/2026-08-12/20260812215627863.mp4"
-    assert video.thumbnail_url == "https://photos.zrc.sg/album/thumb/2026-08-12/20260812215627863.mp4"
+    assert (
+        video.thumbnail_url == "https://photos.zrc.sg/album/thumb/2026-08-12/20260812215627863.mp4"
+    )
 
 
 def test_photo_fields_mapped() -> None:
@@ -60,7 +62,9 @@ def test_photo_fields_mapped() -> None:
     assert photo.album == "2026-08-12"
     assert photo.filename == "20260812101112000.jpg"
     assert photo.photo_url == "https://photos.zrc.sg/album/2026-08-12/20260812101112000.jpg"
-    assert photo.thumbnail_url == "https://photos.zrc.sg/album/thumb/2026-08-12/20260812101112000.jpg"
+    assert (
+        photo.thumbnail_url == "https://photos.zrc.sg/album/thumb/2026-08-12/20260812101112000.jpg"
+    )
 
 
 def test_missing_is_video_attr_falls_back_to_suffix() -> None:
