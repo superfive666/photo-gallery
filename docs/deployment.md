@@ -637,12 +637,15 @@ cd /opt/photo-gallery && docker compose logs -f --tail=100 api
 | `config.sh` 报 token 无效 | 注册 token 只有 1 小时有效期，回网页重新拿一个 |
 | workflow 里 `docker` 报 permission denied | `ghrunner` 没加进 `docker` 组，或加完没重启 runner 服务 |
 | 构建时一堆 `variable is not set` warning | 没带 `--env-file /opt/photo-gallery/.env` |
-| `/healthz` 里 `gpu: false` | 镜像不是 `EMBEDDING_GPU=true` 构建的；或 `.env` 少了 `EMBEDDING_USE_GPU=true`；或 `.env` 少了 `COMPOSE_FILE=...gpu.yml`（容器没挂到卡） |
+| embedding 起不来，日志报 `CUDA provider 未生效` | 这是**有意的拒绝启动**（不再静默退回 CPU）。按报错里的排查顺序：onnxruntime 缺库日志 → 镜像是否 GPU 构建 → 驱动 ≥580 → 是否叠加 gpu.yml |
+| embedding 日志有 `Failed to load library ... libcublasLt` | 旧版镜像缺 CUDA 运行时库 —— 重新部署即可，新构建会装齐并在构建期校验 |
+| `/healthz` 里 `gpu: false` 但没报错 | `.env` 少了 `EMBEDDING_USE_GPU=true`（这属于「没要求 GPU」，不触发拒绝启动） |
 | `batch_supported: false` | 识别模型 ONNX 的 batch 维是固定 1，批量退化为逐张。需要换一份动态 batch 导出 |
 | 服务起来了但登录说邀请码错（401） | `INVITE_CODE_HASH` 抄漏了字符，或生成时用的明文不是分发出去的那个 |
 | 登录直接 500 | `INVITE_CODE_HASH` 没用单引号包住，`$argon2id` 等被 compose 当变量啃掉了；`docker compose logs api` 里会有 `invite_code_hash_invalid` |
 | 第二次部署后连不上数据库 | `.env` 被 `git clean` 删过 —— 确认它在 `/opt/photo-gallery` 而不是 runner 工作区 |
 | 一个人搜几次全站就被限流 | `real_ip` 没生效或 8080 被暴露，所有请求的来源 IP 塌成了同一个 |
+| web 容器 unhealthy 但页面正常 | 旧镜像的探活用 `localhost`（在 alpine 里先解析成 ::1，nginx 只听 IPv4）——纯误报，重新部署即可 |
 | `ingest` 跑完 0 张入库 | 相册页解析没收敛，先跑 `jobs probe`（见 [`data-source.md`](data-source.md)） |
 | migrate 报 connection refused | pg 只听 localhost（`listen_addresses`），或 ufw 没放行 docker 网段（2.3③ / 2.7） |
 | migrate 报 no pg_hba.conf entry | `pg_hba.conf` 少了 172.16.0.0/12 那行，或加在了 reject 之后 |

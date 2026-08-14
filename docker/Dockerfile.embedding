@@ -49,8 +49,20 @@ ENV PATH="/app/.venv/bin:$PATH" \
 #
 #   docker compose build --build-arg EMBEDDING_GPU=true embedding
 #
-# 还需要：宿主机装好 NVIDIA 驱动与 nvidia container runtime，
-# compose 里给 embedding 加 gpus，并设 EMBEDDING_USE_GPU=true。见 docker/README.md。
+# ⚠️ onnxruntime-gpu 只是「会调用 CUDA 的代码」，CUDA 运行时库并不随它安装；
+# nvidia-container-toolkit 也只往容器里注入**驱动**（libcuda.so.1），不含工具包。
+# 缺库时 onnxruntime 不报致命错误，只是静默退回 CPU —— 首次上线就中过这个招
+# （libcublasLt.so.13 找不到，GPU 机跑了十小时 CPU 推理）。
+# 所以这里要装齐 CUDA 运行时轮子。清单来自对 onnxruntime-gpu 1.28.0 的
+# providers_cuda.so 做 readelf/strings 实测：
+#   NEEDED： libcublas(Lt).so.13  libcudart.so.13  libcurand.so.10
+#   dlopen： libcudnn.so  libnvrtc.so.13
+# （libcuda.so.1 是驱动，运行时由 nvidia-container-toolkit 注入，不装。）
+# 代价：镜像大约 +1.5GB。ORT 升级到新 CUDA 大版本时，把 cu13 后缀跟着换。
+#
+# 还需要：宿主机装好 NVIDIA 驱动（CUDA 13 系需要 ≥580）与 nvidia container
+# runtime，compose 里给 embedding 加 gpus，并设 EMBEDDING_USE_GPU=true。
+# 见 docker/README.md。
 # ---------------------------------------------------------------------------
 ARG EMBEDDING_GPU=false
 RUN if [ "$EMBEDDING_GPU" = "true" ]; then \
@@ -58,7 +70,32 @@ RUN if [ "$EMBEDDING_GPU" = "true" ]; then \
         ORT_VER="$(uv pip show onnxruntime | awk '/^Version:/{print $2}')"; \
         echo "替换 onnxruntime ${ORT_VER} → onnxruntime-gpu ${ORT_VER}"; \
         uv pip uninstall onnxruntime; \
-        uv pip install "onnxruntime-gpu==${ORT_VER}"; \
+        uv pip install "onnxruntime-gpu==${ORT_VER}" \
+            nvidia-cublas-cu13 \
+            nvidia-cuda-runtime-cu13 \
+            nvidia-curand-cu13 \
+            nvidia-cudnn-cu13 \
+            nvidia-cuda-nvrtc-cu13; \
+        SITE="/app/.venv/lib/python3.11/site-packages"; \
+        # 让动态链接器能找到 pip 装进 site-packages 的 CUDA 库
+        ls -d "$SITE"/nvidia/*/lib > /etc/ld.so.conf.d/zz-nvidia-pip.conf; \
+        # ORT 用不带版本号的名字 dlopen cudnn，而轮子里只有 libcudnn.so.9 —— 补软链
+        for d in "$SITE"/nvidia/*/lib; do \
+            for f in "$d"/lib*.so.*; do \
+                [ -e "$f" ] || continue; \
+                base="${f%%.so.*}.so"; \
+                [ -e "$base" ] || ln -s "$(basename "$f")" "$base"; \
+            done; \
+        done; \
+        ldconfig; \
+        # 构建期就验证 CUDA provider 的静态依赖全部可解析，别把「运行时才发现
+        # 缺库然后静默退回 CPU」的镜像交出去。libcuda.so.1 构建机上没有属正常。
+        missing="$(ldd "$SITE/onnxruntime/capi/libonnxruntime_providers_cuda.so" \
+                   | grep 'not found' | grep -v 'libcuda\.so\.1' || true)"; \
+        if [ -n "$missing" ]; then \
+            echo "CUDA provider 依赖缺失："; echo "$missing"; exit 1; \
+        fi; \
+        echo "CUDA provider 依赖齐全"; \
     fi
 
 # ---------------------------------------------------------------------------
