@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     invite_code_hash: str = ""
     jwt_secret: str = PLACEHOLDER_SECRET
     session_ttl_hours: int = 12
+    # session cookie 的 Secure 属性。默认 true（生产走 HTTPS）；
+    # 内网 http 直测阶段设 false —— 否则浏览器直接拒收 Secure cookie，
+    # 表现为「登录 200 但下一个请求 401」。上 HTTPS 后必须改回 true。
+    session_cookie_secure: bool = True
     audit_hash_salt: str = PLACEHOLDER_SECRET
 
     # --- 上传防护 ---

@@ -18,8 +18,10 @@ export function AlbumFilter({
   onChange: (album: string) => void
   disabled: boolean
 }) {
-  // 库里只有一个相册时筛选器没有意义，不占屏幕
-  if (albums.length <= 1) return null
+  // 一个相册都没有（还没建库）时不占屏幕。
+  // 只有一个相册也照样显示：筛选对结果虽无影响，但「哪些活动已经能搜」
+  // 这个信息本身有价值 —— 建库初期用户会想确认自己参加的那场在不在里面。
+  if (albums.length === 0) return null
 
   return (
     <div className="space-y-2">

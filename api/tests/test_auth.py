@@ -52,3 +52,17 @@ def test_hash_invite_tool_output_is_env_safe() -> None:
     line = f"INVITE_CODE_HASH='{hash_invite_code('sesame')}'"
     assert line.startswith("INVITE_CODE_HASH='$argon2id$")
     assert line.endswith("'")
+
+
+def test_session_cookie_secure_flag_respected() -> None:
+    """http 直测阶段 SESSION_COOKIE_SECURE=false 时，cookie 不能带 Secure ——
+    否则浏览器拒收，表现为「登录 200 但下一个请求 401」（真实发生过）。"""
+    from fastapi import Response
+
+    from api.app.auth import issue_session
+
+    for secure in (True, False):
+        resp = Response()
+        issue_session(resp, Settings(session_cookie_secure=secure))
+        header = resp.headers["set-cookie"]
+        assert ("Secure" in header) is secure, header
