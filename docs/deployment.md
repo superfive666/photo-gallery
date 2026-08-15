@@ -400,6 +400,21 @@ EVAL_DIR=/opt/photo-gallery/data/eval
 uv run python -m api.app.tools.hash_invite
 ```
 
+`INVITE_CODE_HASH` 是**全相册管理码**（站主自用）。发给成员的码用绑定相册的
+邀请码 —— 存数据库、逐相册隔离、可单独吊销：
+
+```bash
+# 在生产机上（jobs 容器里带齐了依赖和 DATABASE_URL）
+docker compose run --rm jobs python -m jobs invite create --album 2026-08-10 --label "发给张三"
+# 输出的完整码只显示这一次，立即发给对方；库里只存 hash，无法找回
+docker compose run --rm jobs python -m jobs invite list
+docker compose run --rm jobs python -m jobs invite disable --prefix <8位hex>
+# 吊销不影响已登录的 session，会随 JWT 过期（SESSION_TTL_HOURS）自然失效
+```
+
+持这种码登录的用户：只能检索绑定的那个相册、相册下拉锁定为该相册、
+拿别的相册的照片一律 404。
+
 `COMPOSE_FILE` 写在 `.env` 里而不是每次加 `-f`：这样 workflow、`make up`、
 手敲的 `docker compose ps` 全都自动带上 GPU 叠加层，不会出现「手动起的没挂 GPU」
 这种只在事后从日志里才发现的偏差。

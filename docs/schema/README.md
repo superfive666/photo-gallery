@@ -27,6 +27,7 @@ Postgres 16 + [pgvector](https://github.com/pgvector/pgvector) ≥ 0.8。
 | `photo` | 一张照片/视频一行 | `album` 只属于这里；`photo_url` 唯一 → 幂等；`thumbnail BYTEA` 走 TOAST；软删除 |
 | `face` | **向量主表**，一张脸一行 | 普通表不分区；`embedding` 上 HNSW cosine 索引 |
 | `block_list` | opt-out | 按 face 或 photo；检索在 SQL 层过滤 |
+| `invite_code` | 邀请码 ↔ 相册绑定 | `prefix` 唯一索引定位行 → 单次 argon2 验证；`album` NULL = 全相册；吊销置 `disabled_at` 不删行 |
 | `album_sync_state` | 同步进度 | 按 album slug |
 | `job_run` | 离线任务记录 | 排查召回率变差的第一现场 |
 | `search_audit` | 检索留痕 | **只有计数与耗时**，无图片无向量 |
