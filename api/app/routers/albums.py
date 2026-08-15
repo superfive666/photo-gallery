@@ -22,9 +22,10 @@ class AlbumOut(BaseModel):
 
 
 @router.get("", response_model=list[AlbumOut])
-async def list_albums(db: DbDep, _session: SessionDep) -> list[AlbumOut]:
+async def list_albums(db: DbDep, session: SessionDep) -> list[AlbumOut]:
     # 只列出真的有可检索人脸的相册：一个只有风景照的相册出现在筛选器里
     # 只会让用户白选一次。
+    # 绑定相册的 session 只能看见自己的那一个 —— 相册名（活动日期）本身也是信息。
     rows = (
         await db.execute(
             text(
@@ -35,11 +36,13 @@ async def list_albums(db: DbDep, _session: SessionDep) -> list[AlbumOut]:
                 FROM photo
                 WHERE deleted_at IS NULL
                   AND processing_status = 'embedded'
+                  AND (CAST(:scope AS text) IS NULL OR album = :scope)
                 GROUP BY album
                 HAVING coalesce(sum(face_count), 0) > 0
                 ORDER BY album DESC
                 """
-            )
+            ),
+            {"scope": session.album},
         )
     ).all()
     return [

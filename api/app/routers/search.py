@@ -11,12 +11,21 @@ from __future__ import annotations
 
 import time
 
-from fastapi import APIRouter, File, Form, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.app.auth import audit_hash
-from api.app.deps import ClientIpDep, DbDep, EmbeddingDep, LimitersDep, SessionDep, SettingsDep
+from api.app.auth import SessionInfo, audit_hash
+from api.app.deps import (
+    ClientIpDep,
+    CsrfDep,
+    DbDep,
+    DeviceDep,
+    EmbeddingDep,
+    LimitersDep,
+    SessionDep,
+    SettingsDep,
+)
 from api.app.services.search import search_by_embedding
 from gallery_core.config import Settings
 from gallery_core.embedding_client import EmbeddingServiceError
@@ -57,6 +66,8 @@ async def search(
     session: SessionDep,
     limiters: LimitersDep,
     ip: ClientIpDep,
+    device: DeviceDep,
+    _csrf: CsrfDep,
     selfies: list[UploadFile] = File(...),  # noqa: B008
     # 只在某个相册里找。不带则搜全部相册。
     album: str | None = Form(default=None),
@@ -66,11 +77,12 @@ async def search(
     started = time.perf_counter()
 
     validate_count(selfies, settings)
-    album_filter = _normalize_album(album)
+    album_filter = _enforce_scope(_normalize_album(album), session)
 
-    session_limiter, ip_limiter = limiters
-    session_limiter.check(f"search:{session}")
+    session_limiter, ip_limiter, device_limiter = limiters
+    session_limiter.check(f"search:{session.sid}")
     ip_limiter.check(f"search:{ip}")
+    device_limiter.check(f"search:{device}")
 
     # 每张自拍只取**最明显的一张脸**（面积最大者），筛选在 embedding 服务端完成，
     # 其余人脸根本不会被向量化 —— 用户要找的是自己，背景里的路人不该参与匹配。
@@ -95,7 +107,7 @@ async def search(
     latency_ms = int((time.perf_counter() - started) * 1000)
 
     if not vectors:
-        await _audit(db, session, ip, settings, album_filter, 0, 0, 0, latency_ms)
+        await _audit(db, session.sid, ip, settings, album_filter, 0, 0, 0, latency_ms)
         return SearchOut(
             matches=[],
             faces_used=0,
@@ -110,7 +122,7 @@ async def search(
 
     await _audit(
         db,
-        session,
+        session.sid,
         ip,
         settings,
         album_filter,
@@ -159,6 +171,19 @@ def _normalize_album(album: str | None) -> str | None:
     if not trimmed:
         return None
     return trimmed[:ALBUM_MAX_LEN]
+
+
+def _enforce_scope(requested: str | None, session: SessionInfo) -> str | None:
+    """把检索限制在 session 绑定的相册内（服务端硬边界，不信任前端）。
+
+    绑定相册的 session：请求别的相册 → 403 明确报错（按用户要求，不做静默收窄）；
+    没选相册 → 强制填上绑定相册。全相册 session 原样放行。
+    """
+    if session.album is None:
+        return requested
+    if requested is not None and requested != session.album:
+        raise HTTPException(status_code=403, detail="邀请码与所选相册不符")
+    return session.album
 
 
 async def _audit(

@@ -15,6 +15,18 @@ export interface Album {
   face_count: number
 }
 
+export interface Captcha {
+  token: string
+  // SVG 文本，转 data URI 后塞进 <img> 展示
+  svg: string
+}
+
+export interface SessionState {
+  authenticated: boolean
+  // 本 session 绑定的相册；null = 可搜全部相册
+  album: string | null
+}
+
 export type SearchStatus = 'ok' | 'no_face' | 'no_match'
 
 export interface SearchResponse {
@@ -51,26 +63,58 @@ async function parseError(response: Response): Promise<never> {
   throw new ApiError(response.status, detail, retryAfter ? Number(retryAfter) : undefined)
 }
 
-export async function login(inviteCode: string, consent: boolean): Promise<void> {
+/**
+ * CSRF 双提交：登录时后端会种一个**非** HttpOnly 的 zrc_csrf cookie，
+ * 这里读出来回填到 X-CSRF-Token 头。跨站攻击者发得出请求但读不到 cookie，
+ * 所以头对得上就证明请求来自本站页面。
+ */
+function csrfHeaders(): Record<string, string> {
+  const token = document.cookie.match(/(?:^|;\s*)zrc_csrf=([^;]+)/)?.[1]
+  return token ? { 'X-CSRF-Token': token } : {}
+}
+
+export async function fetchCaptcha(): Promise<Captcha> {
+  const response = await fetch(`${BASE}/session/captcha`, { credentials: 'same-origin' })
+  if (!response.ok) await parseError(response)
+  return (await response.json()) as Captcha
+}
+
+export async function login(
+  inviteCode: string,
+  consent: boolean,
+  captchaToken: string,
+  captchaAnswer: string,
+): Promise<SessionState> {
   const response = await fetch(`${BASE}/session/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     // session 走 HttpOnly cookie，必须带上凭据
     credentials: 'same-origin',
-    body: JSON.stringify({ invite_code: inviteCode, consent }),
+    body: JSON.stringify({
+      invite_code: inviteCode,
+      consent,
+      captcha_token: captchaToken,
+      captcha_answer: captchaAnswer,
+    }),
   })
   if (!response.ok) await parseError(response)
+  const body = (await response.json()) as { album?: string | null }
+  return { authenticated: true, album: body.album ?? null }
 }
 
-export async function checkSession(): Promise<boolean> {
+export async function checkSession(): Promise<SessionState> {
   const response = await fetch(`${BASE}/session/me`, { credentials: 'same-origin' })
-  if (!response.ok) return false
-  const body = (await response.json()) as { authenticated?: boolean }
-  return body.authenticated === true
+  if (!response.ok) return { authenticated: false, album: null }
+  const body = (await response.json()) as { authenticated?: boolean; album?: string | null }
+  return { authenticated: body.authenticated === true, album: body.album ?? null }
 }
 
 export async function logout(): Promise<void> {
-  await fetch(`${BASE}/session/logout`, { method: 'POST', credentials: 'same-origin' })
+  await fetch(`${BASE}/session/logout`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: csrfHeaders(),
+  })
 }
 
 export async function listAlbums(): Promise<Album[]> {
@@ -82,12 +126,13 @@ export async function listAlbums(): Promise<Album[]> {
 export async function search(files: File[], album?: string): Promise<SearchResponse> {
   const form = new FormData()
   for (const file of files) form.append('selfies', file, file.name)
-  // 带上 album 会让后端走分区裁剪，只在那一个相册里检索
+  // 带上 album 只在那一个相册里检索。绑定相册的邀请码不需要带 —— 后端会强制限定
   if (album) form.append('album', album)
 
   const response = await fetch(`${BASE}/search`, {
     method: 'POST',
     credentials: 'same-origin',
+    headers: csrfHeaders(),
     body: form,
   })
   if (!response.ok) await parseError(response)

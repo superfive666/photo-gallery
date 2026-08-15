@@ -192,3 +192,24 @@ class SchemaMigration(Base):
     applied_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class InviteCode(Base):
+    """邀请码 ↔ 相册绑定。见 docs/schema/002_invite_code.sql 与 plans/0006。
+
+    码的形态是 `<prefix>.<secret>`：prefix 公开、唯一索引定位行，secret 只存
+    argon2 hash —— 登录因此只做一次 argon2 验证。album 为 NULL 是全相册管理码。
+    吊销置 disabled_at，不删行。
+    """
+
+    __tablename__ = "invite_code"
+
+    id: Mapped[uuid.UUID] = _uuid7_pk()
+    prefix: Mapped[str] = mapped_column(String(16), unique=True)
+    code_hash: Mapped[str] = mapped_column(Text)
+    album: Mapped[str | None] = mapped_column(ALBUM_TYPE)
+    label: Mapped[str | None] = mapped_column(Text)
+    disabled_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

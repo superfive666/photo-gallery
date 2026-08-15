@@ -65,8 +65,13 @@ class Settings(BaseSettings):
 
     # --- 上传防护 ---
     rate_limit_searches_per_hour: int = 30
+    # 设备维度（zrc_device cookie）的检索频控。清 cookie 可绕过，
+    # 硬边界仍是 IP 与 session 两层 —— 这层只是抬高普通滥用的成本。
+    rate_limit_searches_per_device_per_hour: int = 3
     max_upload_bytes: int = 10 * 1024 * 1024
     max_selfies_per_search: int = 3
+    # 登录 captcha 的有效期（秒）。签发后超时未用即作废。
+    captcha_ttl_seconds: int = 300
 
     # --- 源站 photos.zrc.sg（公开、无需鉴权）---
     source_adapter: Literal["local_dir", "static_gallery"] = "static_gallery"

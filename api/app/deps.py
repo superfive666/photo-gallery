@@ -5,10 +5,10 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import Depends, Request
+from fastapi import Depends, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.app.auth import require_session
+from api.app.auth import SessionInfo, ensure_device_id, require_csrf, require_session
 from api.app.rate_limit import SlidingWindowLimiter
 from gallery_core.config import Settings, get_settings
 from gallery_core.db import get_sessionmaker
@@ -39,19 +39,39 @@ def embedding_client(request: Request) -> EmbeddingClient:
 EmbeddingDep = Annotated[EmbeddingClient, Depends(embedding_client)]
 
 
-def session_id(request: Request, settings: SettingsDep) -> str:
+def session_info(request: Request, settings: SettingsDep) -> SessionInfo:
     return require_session(request, settings)
 
 
-SessionDep = Annotated[str, Depends(session_id)]
+SessionDep = Annotated[SessionInfo, Depends(session_info)]
 
 
-def search_limiters(request: Request) -> tuple[SlidingWindowLimiter, SlidingWindowLimiter]:
+def csrf_guard(request: Request) -> None:
+    """双提交 CSRF 校验。挂在所有会改变状态/消耗资源的 POST 上。"""
+    require_csrf(request)
+
+
+CsrfDep = Annotated[None, Depends(csrf_guard)]
+
+
+def device_id(request: Request, response: Response, settings: SettingsDep) -> str:
+    return ensure_device_id(request, response, settings)
+
+
+DeviceDep = Annotated[str, Depends(device_id)]
+
+
+def search_limiters(
+    request: Request,
+) -> tuple[SlidingWindowLimiter, SlidingWindowLimiter, SlidingWindowLimiter]:
     state = request.app.state
-    return state.session_limiter, state.ip_limiter
+    return state.session_limiter, state.ip_limiter, state.device_limiter
 
 
-LimitersDep = Annotated[tuple[SlidingWindowLimiter, SlidingWindowLimiter], Depends(search_limiters)]
+LimitersDep = Annotated[
+    tuple[SlidingWindowLimiter, SlidingWindowLimiter, SlidingWindowLimiter],
+    Depends(search_limiters),
+]
 
 
 def client_ip(request: Request) -> str:

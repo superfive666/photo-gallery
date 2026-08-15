@@ -5,6 +5,9 @@ python -m jobs probe  [--album 2026-08-10]        # 探查源站页面结构
 python -m jobs ingest [--album ID] [--full]
 python -m jobs eval   [--dir /data/eval] [--sweep]
 python -m jobs block  --selfie <路径> | --face <uuid> | --photo <uuid> [--reason ...]
+python -m jobs invite create --album 2026-08-10 [--label "发给谁"]   # 发一张绑定相册的码
+python -m jobs invite list
+python -m jobs invite disable --prefix <8位hex>
 """
 
 from __future__ import annotations
@@ -292,6 +295,91 @@ async def cmd_block(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_invite(args: argparse.Namespace) -> int:
+    """邀请码运维：发码 / 列码 / 吊销。
+
+    完整码只在 create 的输出里出现一次 —— 库里只有 prefix + argon2(secret)，
+    丢了就吊销重发，没有「找回」。
+    """
+    from sqlalchemy import select
+
+    from api.app.auth import generate_invite_code
+    from gallery_core.models import InviteCode
+
+    if args.invite_command == "create":
+        full_code, prefix, code_hash = generate_invite_code()
+        async with session_scope() as session:
+            session.add(
+                InviteCode(
+                    prefix=prefix,
+                    code_hash=code_hash,
+                    album=args.album,
+                    label=args.label,
+                )
+            )
+        print(
+            json.dumps(
+                {
+                    "invite_code": full_code,
+                    "prefix": prefix,
+                    "album": args.album,
+                    "label": args.label,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        print(
+            "\n⚠️ 完整邀请码只显示这一次，请立即发给对方。库里只存 hash，无法找回。",
+            file=sys.stderr,
+        )
+        if args.album is None:
+            print("⚠️ 未指定 --album：这是一张全相册的管理码。", file=sys.stderr)
+        return 0
+
+    if args.invite_command == "list":
+        async with session_scope() as session:
+            rows = (
+                (await session.execute(select(InviteCode).order_by(InviteCode.created_at)))
+                .scalars()
+                .all()
+            )
+        print(
+            json.dumps(
+                [
+                    {
+                        "prefix": r.prefix,
+                        "album": r.album,
+                        "label": r.label,
+                        "disabled": r.disabled_at is not None,
+                        "created_at": r.created_at.isoformat(),
+                    }
+                    for r in rows
+                ],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    # disable
+    import datetime as dt
+
+    async with session_scope() as session:
+        row = (
+            await session.execute(select(InviteCode).where(InviteCode.prefix == args.prefix))
+        ).scalar_one_or_none()
+        if row is None:
+            print(f"没有 prefix 为 {args.prefix} 的邀请码", file=sys.stderr)
+            return 2
+        if row.disabled_at is not None:
+            print(f"{args.prefix} 已经是吊销状态（{row.disabled_at.isoformat()}）")
+            return 0
+        row.disabled_at = dt.datetime.now(tz=dt.UTC)
+    print(f"已吊销 {args.prefix}（已登录的 session 会随 JWT 过期自然失效）")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="jobs", description="离线建库与运维任务")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -319,6 +407,15 @@ def main(argv: list[str] | None = None) -> int:
     p_block.add_argument("--reason", default=None)
     p_block.add_argument("--by", default="cli")
 
+    p_invite = sub.add_parser("invite", help="邀请码运维：发码 / 列码 / 吊销")
+    invite_sub = p_invite.add_subparsers(dest="invite_command", required=True)
+    p_inv_create = invite_sub.add_parser("create", help="发一张新码（完整码只显示一次）")
+    p_inv_create.add_argument("--album", default=None, help="绑定的相册 slug；省略 = 全相册管理码")
+    p_inv_create.add_argument("--label", default=None, help="备注：发给谁 / 用途")
+    invite_sub.add_parser("list", help="列出全部邀请码（只有 prefix，没有完整码）")
+    p_inv_disable = invite_sub.add_parser("disable", help="吊销一张码")
+    p_inv_disable.add_argument("--prefix", required=True, help="要吊销的码的 prefix（8 位 hex）")
+
     args = parser.parse_args(argv)
     configure_logging(get_settings().log_level)
 
@@ -328,6 +425,7 @@ def main(argv: list[str] | None = None) -> int:
         "ingest": cmd_ingest,
         "eval": cmd_eval,
         "block": cmd_block,
+        "invite": cmd_invite,
     }
     return asyncio.run(handlers[args.command](args))
 

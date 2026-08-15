@@ -24,6 +24,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.session_limiter = SlidingWindowLimiter(settings.rate_limit_searches_per_hour)
     # IP 维度放宽一些：同一栋楼/同一运营商 NAT 出口下会有多个成员共用 IP
     app.state.ip_limiter = SlidingWindowLimiter(settings.rate_limit_searches_per_hour * 3)
+    # 设备维度最紧（默认 3/小时）。清 cookie 可绕过，所以上面两层才是硬边界。
+    app.state.device_limiter = SlidingWindowLimiter(
+        settings.rate_limit_searches_per_device_per_hour
+    )
 
     if not settings.invite_code_hash:
         # 不 fail-open，但要吵得足够响，避免部署时静默地谁都进不来
