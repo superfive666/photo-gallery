@@ -7,9 +7,11 @@ import {
   listAlbums,
   logout,
   search,
+  searchByFace,
   type SearchResponse,
 } from './api'
 import { AlbumFilter } from './components/AlbumFilter'
+import { BrowsePanel } from './components/BrowsePanel'
 import { DiscardNotice } from './components/DiscardNotice'
 import { EmptyState } from './components/EmptyState'
 import { InviteGate } from './components/InviteGate'
@@ -18,16 +20,21 @@ import { ResultGrid } from './components/ResultGrid'
 import { SelfieUploader, type SelfieItem } from './components/SelfieUploader'
 
 type AuthState = 'checking' | 'anonymous' | 'authenticated'
+// 两种检索方式：上传自拍，或浏览相册后点选照片上的脸
+type Mode = 'selfie' | 'browse'
 
 export function App() {
   const [auth, setAuth] = useState<AuthState>('checking')
   // 邀请码绑定的相册。非 null 时检索被后端硬性限制在这一个相册里，
   // 前端只是如实展示这个边界，不承担安全职责。
   const [scope, setScope] = useState<string | null>(null)
+  const [mode, setMode] = useState<Mode>('selfie')
   const [albums, setAlbums] = useState<Album[]>([])
   const [album, setAlbum] = useState('')
   const [selfies, setSelfies] = useState<SelfieItem[]>([])
   const [result, setResult] = useState<SearchResponse | null>(null)
+  // 「自拍已销毁」的确认只在自拍检索后展示 —— 按脸检索没有上传任何东西
+  const [resultSource, setResultSource] = useState<Mode>('selfie')
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null)
@@ -59,6 +66,7 @@ export function App() {
         scope ? undefined : album || undefined,
       )
       setResult(response)
+      setResultSource('selfie')
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         setAuth('anonymous')
@@ -69,6 +77,23 @@ export function App() {
       setPending(false)
     }
   }, [selfies, album, scope])
+
+  const runFaceSearch = useCallback(async (faceId: string) => {
+    setPending(true)
+    setError(null)
+    try {
+      setResult(await searchByFace(faceId))
+      setResultSource('browse')
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        setAuth('anonymous')
+        return
+      }
+      setError(err instanceof ApiError ? err.message : '检索失败，请稍后再试')
+    } finally {
+      setPending(false)
+    }
+  }, [])
 
   function reset() {
     for (const item of selfies) URL.revokeObjectURL(item.previewUrl)
@@ -116,12 +141,51 @@ export function App() {
         </button>
       </header>
 
-      <SelfieUploader
-        items={selfies}
-        onChange={setSelfies}
-        onSubmit={() => void runSearch()}
-        pending={pending}
-        albumFilter={
+      {/* 两种检索方式的切换。分段控件而不是 tab 条：只有两项，语义是「二选一」 */}
+      <div
+        role="tablist"
+        aria-label="检索方式"
+        className="bg-ink-900 mb-6 grid grid-cols-2 gap-1 rounded-xl p-1"
+      >
+        {(
+          [
+            ['selfie', '自拍搜索'],
+            ['browse', '浏览相册'],
+          ] as const
+        ).map(([value, label]) => (
+          <button
+            key={value}
+            type="button"
+            role="tab"
+            aria-selected={mode === value}
+            onClick={() => setMode(value)}
+            className={`rounded-lg px-4 py-2.5 text-sm font-medium transition-colors ${
+              mode === value ? 'bg-ink-800 text-ink-100' : 'text-ink-400 hover:text-ink-200'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {mode === 'selfie' ? (
+        <SelfieUploader
+          items={selfies}
+          onChange={setSelfies}
+          onSubmit={() => void runSearch()}
+          pending={pending}
+          albumFilter={
+            <AlbumFilter
+              albums={albums}
+              value={album}
+              onChange={setAlbum}
+              disabled={pending}
+              lockedAlbum={scope}
+            />
+          }
+        />
+      ) : (
+        <div className="space-y-4">
           <AlbumFilter
             albums={albums}
             value={album}
@@ -129,8 +193,13 @@ export function App() {
             disabled={pending}
             lockedAlbum={scope}
           />
-        }
-      />
+          <BrowsePanel
+            album={scope ?? album}
+            searching={pending}
+            onSearchByFace={(faceId) => void runFaceSearch(faceId)}
+          />
+        </div>
+      )}
 
       {error && (
         <p role="alert" className="text-danger-500 mt-5 text-sm">
@@ -159,8 +228,8 @@ export function App() {
             </button>
           </div>
 
-          {/* 检索一结束就确认自拍已销毁，不管有没有结果 */}
-          <DiscardNotice confirmed={result.selfie_discarded} />
+          {/* 检索一结束就确认自拍已销毁，不管有没有结果。按脸检索没有上传，不展示 */}
+          {resultSource === 'selfie' && <DiscardNotice confirmed={result.selfie_discarded} />}
 
           {matches.length > 0 ? (
             <ResultGrid matches={matches} onOpen={setLightboxIndex} />

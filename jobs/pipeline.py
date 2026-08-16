@@ -27,7 +27,7 @@ from gallery_core.embedding_client import EmbeddingClient, EmbeddingServiceError
 from gallery_core.logging import get_logger
 from gallery_core.models import Face, JobRun, Photo
 from jobs.sources.base import SourceAdapter, SourceAsset
-from jobs.thumbnails import make_thumbnail
+from jobs.thumbnails import crop_face, make_thumbnail
 
 log = get_logger(__name__)
 
@@ -230,7 +230,7 @@ async def _process_batch(
         raise
 
     photo_rows: list[dict[str, Any]] = []
-    face_specs: list[tuple[str, ExtractResult]] = []
+    face_specs: list[tuple[str, ExtractResult, list[bytes | None]]] = []
 
     for item, result in zip(loaded, results, strict=True):
         if result.error is not None:
@@ -257,7 +257,16 @@ async def _process_batch(
                 "deleted_at": None,
             }
         )
-        face_specs.append((item.asset.photo_url, result))
+        # 人脸小图必须在这里裁 —— 原图字节马上会被 loaded.clear() 释放。
+        # 单张裁剪失败不拖垮整张照片（thumb 可空，前端有占位）。
+        face_thumbs: list[bytes | None] = []
+        for f in result.faces:
+            try:
+                face_thumbs.append(crop_face(item.payload, f.bbox))
+            except Exception as exc:
+                log.warning("face_thumb_failed", error_type=type(exc).__name__)
+                face_thumbs.append(None)
+        face_specs.append((item.asset.photo_url, result, face_thumbs))
 
     # 尽早释放这一批的原图字节。大相册下这能显著压低内存峰值。
     loaded.clear()
@@ -340,10 +349,10 @@ async def _upsert_photos(session: AsyncSession, rows: list[dict[str, Any]]) -> d
 async def _replace_faces(
     session: AsyncSession,
     url_to_id: dict[str, uuid.UUID],
-    specs: list[tuple[str, ExtractResult]],
+    specs: list[tuple[str, ExtractResult, list[bytes | None]]],
     stats: IngestStats,
 ) -> None:
-    photo_ids = [url_to_id[url] for url, _ in specs if url in url_to_id]
+    photo_ids = [url_to_id[url] for url, _, _ in specs if url in url_to_id]
     if not photo_ids:
         return
 
@@ -354,11 +363,11 @@ async def _replace_faces(
     )
 
     face_rows: list[dict[str, Any]] = []
-    for url, result in specs:
+    for url, result, face_thumbs in specs:
         photo_id = url_to_id.get(url)
         if photo_id is None:
             continue
-        for f in result.faces:
+        for f, thumb in zip(result.faces, face_thumbs, strict=True):
             face_rows.append(
                 {
                     "photo_id": photo_id,
@@ -372,6 +381,7 @@ async def _replace_faces(
                     "model_name": f.model_name,
                     "model_version": f.model_version,
                     "dim": f.dim,
+                    "thumb": thumb,
                 }
             )
         stats.faces_discarded += result.discarded

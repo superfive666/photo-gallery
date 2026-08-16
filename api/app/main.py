@@ -24,9 +24,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.session_limiter = SlidingWindowLimiter(settings.rate_limit_searches_per_hour)
     # IP 维度放宽一些：同一栋楼/同一运营商 NAT 出口下会有多个成员共用 IP
     app.state.ip_limiter = SlidingWindowLimiter(settings.rate_limit_searches_per_hour * 3)
-    # 设备维度最紧（默认 3/小时）。清 cookie 可绕过，所以上面两层才是硬边界。
+    # 设备维度最紧（自拍检索默认 3/小时）。设备 id 绑在 JWT 里，
+    # 换身份要重新登录过 captcha；上面两层仍是滥用总量的硬边界。
     app.state.device_limiter = SlidingWindowLimiter(
         settings.rate_limit_searches_per_device_per_hour
+    )
+    # 按脸检索（浏览模式）与自拍检索独立计数（默认 4/小时）
+    app.state.face_device_limiter = SlidingWindowLimiter(
+        settings.rate_limit_face_searches_per_device_per_hour
     )
 
     if not settings.invite_code_hash:

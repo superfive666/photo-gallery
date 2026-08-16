@@ -65,9 +65,11 @@ class Settings(BaseSettings):
 
     # --- 上传防护 ---
     rate_limit_searches_per_hour: int = 30
-    # 设备维度（zrc_device cookie）的检索频控。清 cookie 可绕过，
-    # 硬边界仍是 IP 与 session 两层 —— 这层只是抬高普通滥用的成本。
+    # 设备维度的检索频控。设备 id 在登录时绑进 JWT（见 plans/0007），
+    # 换设备身份必须重新登录过 captcha；硬边界仍是 IP 与 session 两层。
     rate_limit_searches_per_device_per_hour: int = 3
+    # 按已入库人脸检索（浏览模式点脸）的设备频控，与上面的自拍检索**独立计数**
+    rate_limit_face_searches_per_device_per_hour: int = 4
     max_upload_bytes: int = 10 * 1024 * 1024
     max_selfies_per_search: int = 3
     # 登录 captcha 的有效期（秒）。签发后超时未用即作废。

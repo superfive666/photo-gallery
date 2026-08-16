@@ -70,8 +70,7 @@ async def login(
         raise HTTPException(status_code=400, detail="需要先同意隐私说明")
 
     # 邀请码也要限流，否则可以被暴力枚举。设备 cookie 在这里顺带首发。
-    _, ip_limiter, _ = limiters
-    ip_limiter.check(f"login:{ip}")
+    limiters.ip.check(f"login:{ip}")
 
     # captcha 先于邀请码校验：让脚本在便宜的一关就被挡下，argon2 是贵的
     if not captcha.verify(body.captcha_token, body.captcha_answer, settings.jwt_secret):
@@ -79,7 +78,8 @@ async def login(
 
     album = await _resolve_invite(body.invite_code, db, settings)
 
-    issue_session(response, settings, album=album)
+    # 设备 id 绑进 JWT：检索限流用 JWT 里的值，脚本清 cookie 换不来新身份
+    issue_session(response, settings, album=album, device=device)
     return LoginOut(ok=True, ttl_hours=settings.session_ttl_hours, album=album)
 
 

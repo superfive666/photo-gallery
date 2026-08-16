@@ -415,6 +415,15 @@ docker compose run --rm jobs python -m jobs invite disable --prefix <8位hex>
 持这种码登录的用户：只能检索绑定的那个相册、相册下拉锁定为该相册、
 拿别的相册的照片一律 404。
 
+**浏览模式的人脸小图**（plans/0007）在 ingest 时自动生成；003 迁移之前入库的
+存量照片需要**回填一次**（只重新下载原图按已存 bbox 裁剪，不经过 embedding
+服务、不动 GPU，可随时中断重跑）：
+
+```bash
+docker compose run --rm jobs python -m jobs face-thumbs          # 全部相册
+docker compose run --rm jobs python -m jobs face-thumbs --album 2026-08-10
+```
+
 `COMPOSE_FILE` 写在 `.env` 里而不是每次加 `-f`：这样 workflow、`make up`、
 手敲的 `docker compose ps` 全都自动带上 GPU 叠加层，不会出现「手动起的没挂 GPU」
 这种只在事后从日志里才发现的偏差。

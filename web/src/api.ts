@@ -123,6 +123,55 @@ export async function listAlbums(): Promise<Album[]> {
   return (await response.json()) as Album[]
 }
 
+export interface PhotoItem {
+  photo_id: string
+  album: string
+  thumb_url: string | null
+  original_url: string
+  face_count: number
+}
+
+export interface PhotoPage {
+  items: PhotoItem[]
+  total: number
+  page: number
+  per_page: number
+}
+
+export interface FaceItem {
+  face_id: string
+  // 小图可能还没回填（旧数据），null 时前端展示占位
+  thumb_url: string | null
+}
+
+export async function listPhotos(page: number, album?: string): Promise<PhotoPage> {
+  const params = new URLSearchParams({ page: String(page) })
+  if (album) params.set('album', album)
+  const response = await fetch(`${BASE}/photos?${params}`, { credentials: 'same-origin' })
+  if (!response.ok) await parseError(response)
+  return (await response.json()) as PhotoPage
+}
+
+export async function listFaces(photoId: string): Promise<FaceItem[]> {
+  const response = await fetch(`${BASE}/photos/${photoId}/faces`, {
+    credentials: 'same-origin',
+  })
+  if (!response.ok) await parseError(response)
+  return (await response.json()) as FaceItem[]
+}
+
+/** 用一张已入库人脸检索相关照片。与自拍检索独立限流（默认 4 次/小时/设备）。 */
+export async function searchByFace(faceId: string): Promise<SearchResponse> {
+  const response = await fetch(`${BASE}/search/by-face`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', ...csrfHeaders() },
+    body: JSON.stringify({ face_id: faceId }),
+  })
+  if (!response.ok) await parseError(response)
+  return (await response.json()) as SearchResponse
+}
+
 export async function search(files: File[], album?: string): Promise<SearchResponse> {
   const form = new FormData()
   for (const file of files) form.append('selfies', file, file.name)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import Depends, Request, Response
@@ -61,17 +62,28 @@ def device_id(request: Request, response: Response, settings: SettingsDep) -> st
 DeviceDep = Annotated[str, Depends(device_id)]
 
 
-def search_limiters(
-    request: Request,
-) -> tuple[SlidingWindowLimiter, SlidingWindowLimiter, SlidingWindowLimiter]:
+@dataclass(frozen=True, slots=True)
+class Limiters:
+    """四个限流器。session/ip 是滥用总量的硬边界，两种检索共用；
+    device / face_device 分别管自拍检索与按脸检索，互不共享计数。"""
+
+    session: SlidingWindowLimiter
+    ip: SlidingWindowLimiter
+    device: SlidingWindowLimiter
+    face_device: SlidingWindowLimiter
+
+
+def search_limiters(request: Request) -> Limiters:
     state = request.app.state
-    return state.session_limiter, state.ip_limiter, state.device_limiter
+    return Limiters(
+        session=state.session_limiter,
+        ip=state.ip_limiter,
+        device=state.device_limiter,
+        face_device=state.face_device_limiter,
+    )
 
 
-LimitersDep = Annotated[
-    tuple[SlidingWindowLimiter, SlidingWindowLimiter, SlidingWindowLimiter],
-    Depends(search_limiters),
-]
+LimitersDep = Annotated[Limiters, Depends(search_limiters)]
 
 
 def client_ip(request: Request) -> str:
