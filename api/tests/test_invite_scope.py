@@ -114,28 +114,62 @@ def test_legacy_token_without_alb_claim_rejected() -> None:
     assert exc_info.value.status_code == 401
 
 
+def test_session_binds_device_id_into_jwt() -> None:
+    """设备 id 进 JWT：检索限流的键取自 token 而不是请求 cookie ——
+    脚本不带 cookie / 清 cookie 都换不来新设备身份，重登要过 captcha。"""
+    settings = Settings(jwt_secret="unit-test-secret-32-bytes-long!!")
+    response = Response()
+    issue_session(response, settings, device="dev-abc123")
+    cookies = _cookies_from(response)
+    info = require_session(_request(cookies={SESSION_COOKIE: cookies[SESSION_COOKIE]}), settings)
+    assert info.dev == "dev-abc123"
+
+
+def test_token_without_dev_claim_rejected() -> None:
+    """0007 之前的 token 没有 dev claim —— 判无效，不宽容地补默认值。"""
+    import datetime as dt
+
+    import jwt
+
+    settings = Settings(jwt_secret="unit-test-secret-32-bytes-long!!")
+    now = dt.datetime.now(tz=dt.UTC)
+    old_token = jwt.encode(
+        {
+            "sid": "legacy",
+            "alb": None,
+            "iat": int(now.timestamp()),
+            "exp": int((now + dt.timedelta(hours=1)).timestamp()),
+        },
+        settings.jwt_secret,
+        algorithm="HS256",
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        require_session(_request(cookies={SESSION_COOKIE: old_token}), settings)
+    assert exc_info.value.status_code == 401
+
+
 # ------------------------------------------------------------- 检索的强制校验
 
 
 def test_scoped_session_forces_album_when_unset() -> None:
-    session = SessionInfo(sid="s", album="2026-08-10")
+    session = SessionInfo(sid="s", album="2026-08-10", dev="d")
     assert _enforce_scope(None, session) == "2026-08-10"
 
 
 def test_scoped_session_rejects_other_album_with_403() -> None:
-    session = SessionInfo(sid="s", album="2026-08-10")
+    session = SessionInfo(sid="s", album="2026-08-10", dev="d")
     with pytest.raises(HTTPException) as exc_info:
         _enforce_scope("2026-01-01", session)
     assert exc_info.value.status_code == 403
 
 
 def test_scoped_session_allows_matching_album() -> None:
-    session = SessionInfo(sid="s", album="2026-08-10")
+    session = SessionInfo(sid="s", album="2026-08-10", dev="d")
     assert _enforce_scope("2026-08-10", session) == "2026-08-10"
 
 
 def test_unscoped_session_passes_through() -> None:
-    session = SessionInfo(sid="s", album=None)
+    session = SessionInfo(sid="s", album=None, dev="d")
     assert _enforce_scope("2026-01-01", session) == "2026-01-01"
     assert _enforce_scope(None, session) is None
 

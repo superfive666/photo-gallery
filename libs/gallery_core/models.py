@@ -107,6 +107,10 @@ class Face(Base):
     face_px: Mapped[int] = mapped_column(Integer)
     det_score: Mapped[float] = mapped_column(REAL)
 
+    # 浏览模式的人脸小图（160px WebP，入库时从原图按 bbox 裁出）。
+    # 可空：003 之前的存量脸用 `jobs face-thumbs` 回填。见 plans/0007。
+    thumb: Mapped[bytes | None] = mapped_column(LargeBinary)
+
     model_name: Mapped[str] = mapped_column(Text)
     model_version: Mapped[str] = mapped_column(Text)
     dim: Mapped[int] = mapped_column(Integer, default=EMBEDDING_DIM)

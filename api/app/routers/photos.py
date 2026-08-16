@@ -3,16 +3,145 @@ from __future__ import annotations
 import hashlib
 import uuid
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.responses import RedirectResponse
-from sqlalchemy import select
+from pydantic import BaseModel
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.app.auth import SessionInfo
 from api.app.deps import DbDep, SessionDep
-from gallery_core.models import Photo
+from gallery_core.models import Face, Photo
 
 router = APIRouter(prefix="/photos", tags=["photos"])
+
+
+class PhotoItem(BaseModel):
+    photo_id: str
+    album: str
+    thumb_url: str | None
+    original_url: str
+    face_count: int
+
+
+class PhotoPage(BaseModel):
+    items: list[PhotoItem]
+    total: int
+    page: int
+    per_page: int
+
+
+class FaceItem(BaseModel):
+    face_id: str
+    # 小图可能还没回填（003 之前的存量数据），前端做占位
+    thumb_url: str | None
+
+
+@router.get("", response_model=PhotoPage)
+async def list_photos(
+    db: DbDep,
+    session: SessionDep,
+    page: int = Query(default=1, ge=1),
+    per_page: int = Query(default=10, ge=1, le=50),
+    album: str | None = Query(default=None, max_length=200),
+) -> PhotoPage:
+    """浏览模式的分页照片列表。
+
+    scope 与检索同一套规则：绑定相册的 session 传别的相册 → 403，
+    不传 → 强制绑定相册。只列已入库的图片（视频只登记不提取，浏览没意义）。
+    """
+    if session.album is not None:
+        if album is not None and album.strip() and album.strip() != session.album:
+            raise HTTPException(status_code=403, detail="邀请码与所选相册不符")
+        album = session.album
+    elif album is not None and not album.strip():
+        album = None
+
+    conditions = [
+        Photo.deleted_at.is_(None),
+        Photo.kind == "image",
+        Photo.processing_status == "embedded",
+    ]
+    if album is not None:
+        conditions.append(Photo.album == album)
+
+    total = (await db.execute(select(func.count()).select_from(Photo).where(*conditions))).scalar()
+    rows = (
+        await db.execute(
+            select(
+                Photo.id,
+                Photo.album,
+                Photo.face_count,
+                Photo.thumbnail.isnot(None).label("has_thumb"),
+            )
+            .where(*conditions)
+            # uuidv7 时间有序：按 id 排即按入库时间排，稳定且走主键索引
+            .order_by(Photo.id.desc())
+            .offset((page - 1) * per_page)
+            .limit(per_page)
+        )
+    ).all()
+
+    return PhotoPage(
+        items=[
+            PhotoItem(
+                photo_id=str(r.id),
+                album=r.album,
+                thumb_url=f"/api/photos/{r.id}/thumb" if r.has_thumb else None,
+                original_url=f"/api/photos/{r.id}/original",
+                face_count=r.face_count,
+            )
+            for r in rows
+        ],
+        total=total or 0,
+        page=page,
+        per_page=per_page,
+    )
+
+
+@router.get("/{photo_id}/faces", response_model=list[FaceItem])
+async def list_faces(photo_id: uuid.UUID, db: DbDep, session: SessionDep) -> list[FaceItem]:
+    """一张照片上检测到的人脸，最大的脸在前。点脸即可按此人检索（见 /search/by-face）。"""
+    await _load_photo(db, photo_id, session)
+    rows = (
+        await db.execute(
+            select(Face.id, Face.thumb.isnot(None).label("has_thumb"))
+            .where(Face.photo_id == photo_id)
+            .order_by((Face.bbox_w * Face.bbox_h).desc())
+        )
+    ).all()
+    return [
+        FaceItem(
+            face_id=str(r.id),
+            thumb_url=f"/api/photos/faces/{r.id}/thumb" if r.has_thumb else None,
+        )
+        for r in rows
+    ]
+
+
+@router.get("/faces/{face_id}/thumb")
+async def face_thumbnail(face_id: uuid.UUID, db: DbDep, session: SessionDep) -> Response:
+    """人脸小图。scope 越权与不存在统一 404。"""
+    row = (
+        await db.execute(
+            select(Face.thumb, Photo.album)
+            .join(Photo, Photo.id == Face.photo_id)
+            .where(Face.id == face_id, Photo.deleted_at.is_(None))
+        )
+    ).one_or_none()
+    if (
+        row is None
+        or row.thumb is None
+        or (session.album is not None and row.album != session.album)
+    ):
+        raise HTTPException(status_code=404, detail="人脸小图不存在")
+
+    etag = hashlib.sha256(row.thumb).hexdigest()[:32]
+    return Response(
+        content=row.thumb,
+        media_type="image/webp",
+        headers={"ETag": f'"{etag}"', "Cache-Control": "private, max-age=604800"},
+    )
 
 
 async def _load_photo(db: AsyncSession, photo_id: uuid.UUID, session: SessionInfo) -> Photo:

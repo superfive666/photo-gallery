@@ -8,6 +8,7 @@ python -m jobs block  --selfie <路径> | --face <uuid> | --photo <uuid> [--reas
 python -m jobs invite create --album 2026-08-10 [--label "发给谁"]   # 发一张绑定相册的码
 python -m jobs invite list
 python -m jobs invite disable --prefix <8位hex>
+python -m jobs face-thumbs [--album ID]        # 回填存量人脸小图（003 之前的数据）
 """
 
 from __future__ import annotations
@@ -380,6 +381,92 @@ async def cmd_invite(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_face_thumbs(args: argparse.Namespace) -> int:
+    """回填存量人脸小图（003 迁移之前入库的脸）。
+
+    bbox 已经在库里，所以只需要重新下载原图裁剪 —— **不经过 embedding 服务、
+    不动 GPU**。幂等：只处理 thumb IS NULL 的脸，可以随时中断重跑。
+    """
+    from sqlalchemy import text
+
+    from jobs.sources.base import SourceAsset
+    from jobs.thumbnails import crop_face
+
+    adapter = build_adapter()
+    done_faces = 0
+    failed_photos = 0
+
+    async with session_scope() as session:
+        photos = (
+            await session.execute(
+                text(
+                    """
+                    SELECT ph.id, ph.album, ph.photo_url
+                    FROM photo ph
+                    WHERE ph.deleted_at IS NULL
+                      AND ph.kind = 'image'
+                      AND (CAST(:album AS text) IS NULL OR ph.album = :album)
+                      AND EXISTS (
+                          SELECT 1 FROM face f
+                          WHERE f.photo_id = ph.id AND f.thumb IS NULL
+                      )
+                    ORDER BY ph.id
+                    """
+                ),
+                {"album": args.album},
+            )
+        ).all()
+
+    print(f"待回填照片：{len(photos)} 张", file=sys.stderr)
+
+    for photo in photos:
+        asset = SourceAsset(
+            album=photo.album,
+            filename=photo.photo_url.rsplit("/", 1)[-1],
+            photo_url=photo.photo_url,
+        )
+        try:
+            chunks = [chunk async for chunk in adapter.open_asset(asset)]
+            payload = b"".join(chunks)
+        except Exception as exc:
+            failed_photos += 1
+            log.warning("face_thumb_download_failed", error_type=type(exc).__name__)
+            continue
+
+        # 每张照片独立事务：中断/失败不影响已完成的部分
+        async with session_scope() as session:
+            faces = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT id, bbox_x, bbox_y, bbox_w, bbox_h
+                        FROM face
+                        WHERE photo_id = :pid AND thumb IS NULL
+                        """
+                    ),
+                    {"pid": str(photo.id)},
+                )
+            ).all()
+            for face in faces:
+                try:
+                    thumb = crop_face(payload, (face.bbox_x, face.bbox_y, face.bbox_w, face.bbox_h))
+                except Exception as exc:
+                    log.warning("face_thumb_crop_failed", error_type=type(exc).__name__)
+                    continue
+                await session.execute(
+                    text("UPDATE face SET thumb = :thumb WHERE id = :id"),
+                    {"thumb": thumb, "id": str(face.id)},
+                )
+                done_faces += 1
+        del payload
+
+    if hasattr(adapter, "aclose"):
+        await adapter.aclose()
+
+    print(json.dumps({"faces_backfilled": done_faces, "photos_failed": failed_photos}))
+    return 1 if failed_photos else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="jobs", description="离线建库与运维任务")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -416,6 +503,9 @@ def main(argv: list[str] | None = None) -> int:
     p_inv_disable = invite_sub.add_parser("disable", help="吊销一张码")
     p_inv_disable.add_argument("--prefix", required=True, help="要吊销的码的 prefix（8 位 hex）")
 
+    p_ft = sub.add_parser("face-thumbs", help="回填存量人脸小图（只下载原图裁剪，不动 GPU）")
+    p_ft.add_argument("--album", default=None, help="只处理指定相册；省略则处理全部")
+
     args = parser.parse_args(argv)
     configure_logging(get_settings().log_level)
 
@@ -426,6 +516,7 @@ def main(argv: list[str] | None = None) -> int:
         "eval": cmd_eval,
         "block": cmd_block,
         "invite": cmd_invite,
+        "face-thumbs": cmd_face_thumbs,
     }
     return asyncio.run(handlers[args.command](args))
 

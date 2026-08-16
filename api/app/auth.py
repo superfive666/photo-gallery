@@ -48,10 +48,17 @@ _PREFIX_RE = re.compile(r"^[0-9a-f]{8}$")
 
 @dataclass(frozen=True, slots=True)
 class SessionInfo:
-    """一个已通过校验的 session。album 为 None 表示全相册权限。"""
+    """一个已通过校验的 session。album 为 None 表示全相册权限。
+
+    dev 是登录那一刻绑定进 JWT 的设备 id：检索的设备维度限流用它做键，
+    而**不是**用请求时的 cookie —— 脚本不带 cookie 每次都会拿到新设备 id，
+    cookie 键的设备限流对脚本完全无效。绑进 JWT 后想换设备身份只能重新登录，
+    而登录要过 captcha。见 plans/0007。
+    """
 
     sid: str
     album: str | None
+    dev: str
 
 
 # ---------------------------------------------------------------------- 邀请码
@@ -110,10 +117,16 @@ def verify_invite_code(code: str, settings: Settings) -> bool:
 # ---------------------------------------------------------------------- session
 
 
-def issue_session(response: Response, settings: Settings, album: str | None = None) -> str:
+def issue_session(
+    response: Response,
+    settings: Settings,
+    album: str | None = None,
+    device: str | None = None,
+) -> str:
     """签发 session + CSRF 两个 cookie，返回 session id。
 
     album 进 JWT 的 `alb` claim：检索的相册边界由它决定，服务端强制执行。
+    device 进 `dev` claim：设备限流的键，见 SessionInfo 的说明。
     """
     session_id = uuid.uuid4().hex
     now = dt.datetime.now(tz=dt.UTC)
@@ -121,6 +134,7 @@ def issue_session(response: Response, settings: Settings, album: str | None = No
         {
             "sid": session_id,
             "alb": album,
+            "dev": device or secrets.token_hex(16),
             "iat": int(now.timestamp()),
             "exp": int((now + dt.timedelta(hours=settings.session_ttl_hours)).timestamp()),
         },
@@ -155,8 +169,8 @@ def issue_session(response: Response, settings: Settings, album: str | None = No
 def require_session(request: Request, settings: Settings) -> SessionInfo:
     """校验 session。失败抛 401。
 
-    没有 `alb` claim 的旧 token 一律判无效（重新登录一次），
-    而不是宽容地当成全相册 —— 权限升级宁可多登录一次，不能多放行一次。
+    缺 `alb` 或 `dev` claim 的旧 token 一律判无效（重新登录一次），
+    而不是宽容地补默认值 —— 权限收紧时宁可多登录一次，不能多放行一次。
     """
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
@@ -166,12 +180,13 @@ def require_session(request: Request, settings: Settings) -> SessionInfo:
     except jwt.PyJWTError as exc:
         raise HTTPException(status_code=401, detail="会话已失效，请重新输入邀请码") from exc
     sid = payload.get("sid")
-    if not isinstance(sid, str) or "alb" not in payload:
+    dev = payload.get("dev")
+    if not isinstance(sid, str) or not isinstance(dev, str) or "alb" not in payload:
         raise HTTPException(status_code=401, detail="会话已失效，请重新输入邀请码")
     album = payload.get("alb")
     if album is not None and not isinstance(album, str):
         raise HTTPException(status_code=401, detail="会话无效")
-    return SessionInfo(sid=sid, album=album)
+    return SessionInfo(sid=sid, album=album, dev=dev)
 
 
 # ------------------------------------------------------------------ CSRF / 设备

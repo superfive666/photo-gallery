@@ -39,6 +39,7 @@
 ① 离线建库   jobs → photos.zrc.sg → 批量人脸检测/embedding → Postgres(pgvector)
 ② 在线检索   web → api → embedding(自拍取最明显一张脸) → KNN → 照片 URL + 缩略图
 ③ 前端界面   上传/拍摄自拍（可选限定相册）→ 结果网格 → lightbox / 跳回原站原图
+④ 浏览检索   分页翻相册 → 点开照片上的人脸小图 → 确认后用已存 embedding 检索该人
 ```
 
 数据模型只有两张主表：
@@ -130,8 +131,10 @@ EMBEDDING_USE_GPU=true
 - **误报无法归零。** 阈值是 precision/recall 的权衡，调高会漏、调低会串人。阈值标定方法见
   [`docs/evaluation.md`](docs/evaluation.md)。
 - **视频当前不处理**（只登记不提取），见 `docs/plans/`。
-- **设备维度限流（默认 3 次/小时）可以被清 cookie 绕过。** 它抬高的是普通滥用的成本；
-  硬边界是 session 与 IP 两层限流。见 `docs/plans/0006`。
+- **设备维度限流**（自拍检索默认 3 次/小时，按脸检索 4 次/小时，独立计数）的设备 id
+  绑在 JWT 里 —— 清 cookie / 脚本不带 cookie 都换不来新身份，想换必须重新登录过
+  captcha。彻底清空 cookie 后重新登录仍会得到新设备身份，所以硬边界依旧是
+  session 与 IP 两层限流。见 `docs/plans/0007`。
 - **登录验证码挡的是脚本批量试码，不是专业打码平台。** 自研 SVG captcha 的威胁模型
   就到这里 —— 更强的对抗手段（第三方 captcha）与本项目的 CSP 和隐私立场冲突，不做。
 

@@ -10,9 +10,11 @@
 from __future__ import annotations
 
 import time
+import uuid
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.app.auth import SessionInfo, audit_hash
@@ -20,7 +22,6 @@ from api.app.deps import (
     ClientIpDep,
     CsrfDep,
     DbDep,
-    DeviceDep,
     EmbeddingDep,
     LimitersDep,
     SessionDep,
@@ -30,7 +31,7 @@ from api.app.services.search import search_by_embedding
 from gallery_core.config import Settings
 from gallery_core.embedding_client import EmbeddingServiceError
 from gallery_core.logging import get_logger
-from gallery_core.models import ALBUM_MAX_LEN, SearchAudit
+from gallery_core.models import ALBUM_MAX_LEN, Face, Photo, SearchAudit
 from gallery_core.vector import mean_embedding
 
 log = get_logger(__name__)
@@ -66,7 +67,6 @@ async def search(
     session: SessionDep,
     limiters: LimitersDep,
     ip: ClientIpDep,
-    device: DeviceDep,
     _csrf: CsrfDep,
     selfies: list[UploadFile] = File(...),  # noqa: B008
     # 只在某个相册里找。不带则搜全部相册。
@@ -79,10 +79,10 @@ async def search(
     validate_count(selfies, settings)
     album_filter = _enforce_scope(_normalize_album(album), session)
 
-    session_limiter, ip_limiter, device_limiter = limiters
-    session_limiter.check(f"search:{session.sid}")
-    ip_limiter.check(f"search:{ip}")
-    device_limiter.check(f"search:{device}")
+    limiters.session.check(f"search:{session.sid}")
+    limiters.ip.check(f"search:{ip}")
+    # 设备 id 取自 JWT 的 dev claim，不是请求 cookie —— 见 SessionInfo 的说明
+    limiters.device.check(f"search:{session.dev}")
 
     # 每张自拍只取**最明显的一张脸**（面积最大者），筛选在 embedding 服务端完成，
     # 其余人脸根本不会被向量化 —— 用户要找的是自己，背景里的路人不该参与匹配。
@@ -159,6 +159,88 @@ async def search(
         message=None
         if matches
         else "没有找到匹配的照片。可能是这些活动里没有你的照片，或者你出现在照片的远景中。",
+        latency_ms=latency_ms,
+    )
+
+
+class ByFaceIn(BaseModel):
+    # 只收 face_id —— embedding 永远不出库也不入参。
+    # 允许客户端提交裸向量等于把检索接口变成任意向量探针。
+    face_id: uuid.UUID
+
+
+@router.post("/by-face", response_model=SearchOut)
+async def search_by_face(
+    body: ByFaceIn,
+    db: DbDep,
+    settings: SettingsDep,
+    session: SessionDep,
+    limiters: LimitersDep,
+    ip: ClientIpDep,
+    _csrf: CsrfDep,
+) -> SearchOut:
+    """浏览模式：用一张已入库人脸的 embedding 检索相关照片。
+
+    与自拍检索共享 session/IP 两层硬边界，设备维度**独立计数**（默认 4/小时）。
+    """
+    started = time.perf_counter()
+
+    limiters.session.check(f"search:{session.sid}")
+    limiters.ip.check(f"search:{ip}")
+    limiters.face_device.check(f"face-search:{session.dev}")
+
+    row = (
+        await db.execute(
+            select(Face.embedding, Photo.album)
+            .join(Photo, Photo.id == Face.photo_id)
+            .where(Face.id == body.face_id, Photo.deleted_at.is_(None))
+        )
+    ).one_or_none()
+    # 不存在与越权统一 404 —— 不向持码人确认「这个 id 存在，只是你没权限」
+    if row is None or (session.album is not None and row.album != session.album):
+        raise HTTPException(status_code=404, detail="人脸不存在")
+
+    query_vec: list[float] = list(row.embedding)
+    outcome = await search_by_embedding(db, query_vec, settings, album=session.album)
+    latency_ms = int((time.perf_counter() - started) * 1000)
+
+    await _audit(
+        db,
+        session.sid,
+        ip,
+        settings,
+        session.album,
+        1,
+        outcome.candidates_scanned,
+        len(outcome.matches),
+        latency_ms,
+    )
+
+    matches = [
+        MatchOut(
+            photo_id=str(m.photo_id),
+            album=m.album,
+            score=round(m.score, 4),
+            thumb_url=f"/api/photos/{m.photo_id}/thumb" if m.has_thumbnail else None,
+            original_url=f"/api/photos/{m.photo_id}/original",
+        )
+        for m in outcome.matches
+    ]
+
+    log.info(
+        "face_search_done",
+        album=session.album,
+        results=len(matches),
+        latency_ms=latency_ms,
+    )
+
+    return SearchOut(
+        matches=matches,
+        faces_used=1,
+        status="ok" if matches else "no_match",
+        message=None
+        if matches
+        else "没有找到这张脸的其他照片。这个人可能只出现在这一张里，或在别处是侧脸/远景。",
         latency_ms=latency_ms,
     )
 
