@@ -1,5 +1,12 @@
 const BASE = import.meta.env.VITE_API_BASE_URL ?? '/api'
 
+export interface Segment {
+  // 命中人脸在视频里的出现区间（毫秒）。跳转用 original_url + #t=秒
+  start_ms: number
+  end_ms: number
+  score: number
+}
+
 export interface Match {
   photo_id: string
   // album slug，形如 '2026-08-10'，与源站 /album/<slug> 一致
@@ -7,6 +14,10 @@ export interface Match {
   score: number
   thumb_url: string | null
   original_url: string
+  kind: 'image' | 'video'
+  duration_ms: number | null
+  // 仅视频：出现时间段（相邻段服务端已合并）。照片恒为空数组
+  segments: Segment[]
 }
 
 export interface Album {
@@ -129,6 +140,8 @@ export interface PhotoItem {
   thumb_url: string | null
   original_url: string
   face_count: number
+  kind: 'image' | 'video'
+  duration_ms: number | null
 }
 
 export interface PhotoPage {

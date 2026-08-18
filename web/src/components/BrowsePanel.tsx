@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 
 import { ApiError, type PhotoItem, type PhotoPage, listPhotos } from '../api'
+import { formatMs } from '../lib/time'
 import { FacePicker } from './FacePicker'
 
 /**
@@ -79,6 +80,12 @@ export function BrowsePanel({
             ) : (
               <span className="text-ink-600 grid size-full place-items-center text-xs">
                 无预览
+              </span>
+            )}
+            {photo.kind === 'video' && (
+              <span className="bg-ink-950/80 text-ink-200 absolute top-1.5 left-1.5 flex items-center gap-1 rounded-full px-2 py-0.5 text-xs">
+                <span aria-hidden="true">▶</span>
+                {photo.duration_ms != null ? formatMs(photo.duration_ms) : '视频'}
               </span>
             )}
             {photo.face_count > 0 && (

@@ -1,6 +1,7 @@
 import { useMemo } from 'react'
 
 import type { Match } from '../api'
+import { formatMs } from '../lib/time'
 
 /**
  * 结果网格。按相册分组 —— 用户的心智模型是「哪次活动」，而不是一个连续的相似度队列。
@@ -35,7 +36,7 @@ export function ResultGrid({
                 {match.thumb_url ? (
                   <img
                     src={match.thumb_url}
-                    alt={`${group.album} 的照片`}
+                    alt={`${group.album} 的${match.kind === 'video' ? '视频' : '照片'}`}
                     // 懒加载 + 固定宽高比，避免长列表一次性发起几百个请求
                     loading="lazy"
                     decoding="async"
@@ -44,6 +45,12 @@ export function ResultGrid({
                 ) : (
                   <span className="text-ink-600 grid size-full place-items-center text-xs">
                     无预览
+                  </span>
+                )}
+                {match.kind === 'video' && (
+                  <span className="bg-ink-950/80 text-ink-200 absolute right-1 bottom-1 flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px]">
+                    <span aria-hidden="true">▶</span>
+                    {match.duration_ms != null ? formatMs(match.duration_ms) : '视频'}
                   </span>
                 )}
               </button>

@@ -22,6 +22,8 @@ class PhotoItem(BaseModel):
     thumb_url: str | None
     original_url: str
     face_count: int
+    kind: str = "image"  # image | video
+    duration_ms: int | None = None
 
 
 class PhotoPage(BaseModel):
@@ -59,7 +61,8 @@ async def list_photos(
 
     conditions = [
         Photo.deleted_at.is_(None),
-        Photo.kind == "image",
+        # 视频自 plans/0008 起也可浏览（tracklet 人脸小图 + 点脸检索同一条链路）
+        Photo.kind.in_(("image", "video")),
         Photo.processing_status == "embedded",
     ]
     if album is not None:
@@ -72,6 +75,8 @@ async def list_photos(
                 Photo.id,
                 Photo.album,
                 Photo.face_count,
+                Photo.kind,
+                Photo.duration_ms,
                 Photo.thumbnail.isnot(None).label("has_thumb"),
             )
             .where(*conditions)
@@ -90,6 +95,8 @@ async def list_photos(
                 thumb_url=f"/api/photos/{r.id}/thumb" if r.has_thumb else None,
                 original_url=f"/api/photos/{r.id}/original",
                 face_count=r.face_count,
+                kind=r.kind,
+                duration_ms=r.duration_ms,
             )
             for r in rows
         ],

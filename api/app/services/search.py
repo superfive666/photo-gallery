@@ -33,12 +33,25 @@ _ALBUM_FILTER_CANDIDATE_MULTIPLIER = 4
 
 
 @dataclass(frozen=True, slots=True)
+class Segment:
+    """视频里命中人脸的一段出现区间。"""
+
+    start_ms: int
+    end_ms: int
+    score: float
+
+
+@dataclass(frozen=True, slots=True)
 class PhotoMatch:
     photo_id: uuid.UUID
     album: str
     photo_url: str
     score: float
     has_thumbnail: bool
+    kind: str = "image"
+    duration_ms: int | None = None
+    # 仅视频：命中段列表（相邻段已合并、按时间升序）。照片恒为空列表。
+    segments: tuple[Segment, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,9 +84,21 @@ _SEARCH_SQL = text(
     SELECT ph.id                        AS photo_id,
            ph.album                     AS album,
            ph.photo_url                 AS photo_url,
+           ph.kind                      AS kind,
+           ph.duration_ms               AS duration_ms,
            (ph.thumbnail IS NOT NULL)   AS has_thumbnail,
-           MAX(c.sim)                   AS score
+           MAX(c.sim)                   AS score,
+           -- 视频：命中 tracklet 的出现区间。照片行 t_start_ms 恒 NULL → segments 为 NULL
+           jsonb_agg(
+               jsonb_build_object(
+                   'start_ms', f.t_start_ms,
+                   'end_ms',   f.t_end_ms,
+                   'score',    round(CAST(c.sim AS numeric), 4)
+               )
+               ORDER BY f.t_start_ms
+           ) FILTER (WHERE f.t_start_ms IS NOT NULL) AS segments
     FROM candidate c
+    JOIN face  f  ON f.id  = c.face_id
     JOIN photo ph ON ph.id = c.photo_id
     WHERE c.sim >= :threshold
       AND ph.deleted_at IS NULL
@@ -82,11 +107,43 @@ _SEARCH_SQL = text(
       AND (CAST(:album AS text) IS NULL OR ph.album = CAST(:album AS text))
       AND NOT EXISTS (SELECT 1 FROM block_list b WHERE b.face_id  = c.face_id)
       AND NOT EXISTS (SELECT 1 FROM block_list b WHERE b.photo_id = ph.id)
-    GROUP BY ph.id, ph.album, ph.photo_url, ph.thumbnail IS NOT NULL
+    GROUP BY ph.id
     ORDER BY score DESC, ph.album DESC
     LIMIT :limit
     """
 )
+
+
+# 前端把间隔很近的两段显示成一段更符合直觉（转头/遮挡造成的断段是技术细节）。
+# 合并放在服务端做，两个检索入口与将来的调用方都不用各自实现一遍。
+_SEGMENT_MERGE_GAP_MS = 2000
+
+
+def _merge_segments(raw: object) -> tuple[Segment, ...]:
+    """把 SQL 聚合出的段列表按邻近合并。容忍 asyncpg 把 jsonb 回成 str 的情形。"""
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        import json
+
+        raw = json.loads(raw)
+    assert isinstance(raw, list)
+
+    merged: list[Segment] = []
+    for item in raw:
+        seg = Segment(
+            start_ms=int(item["start_ms"]), end_ms=int(item["end_ms"]), score=float(item["score"])
+        )
+        if merged and seg.start_ms - merged[-1].end_ms <= _SEGMENT_MERGE_GAP_MS:
+            last = merged[-1]
+            merged[-1] = Segment(
+                start_ms=last.start_ms,
+                end_ms=max(last.end_ms, seg.end_ms),
+                score=max(last.score, seg.score),
+            )
+        else:
+            merged.append(seg)
+    return tuple(merged)
 
 
 async def search_by_embedding(
@@ -125,6 +182,9 @@ async def search_by_embedding(
             photo_url=r.photo_url,
             score=float(r.score),
             has_thumbnail=bool(r.has_thumbnail),
+            kind=r.kind,
+            duration_ms=r.duration_ms,
+            segments=_merge_segments(r.segments),
         )
         for r in rows
     ]

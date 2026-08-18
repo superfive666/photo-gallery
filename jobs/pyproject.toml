@@ -13,6 +13,8 @@ dependencies = [
     "lxml>=5.3",
     # jobs/eval.py 直接调用 api 里那份真实的检索函数，见 docs/architecture.md 第 6 节
     "api",
+    # 视频抽帧（自带 ffmpeg 二进制，无需 apt 装 ffmpeg），见 plans/0008
+    "av>=18.1.0",
 ]
 
 [tool.uv]

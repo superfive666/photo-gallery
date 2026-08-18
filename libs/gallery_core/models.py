@@ -67,6 +67,8 @@ class Photo(Base):
     thumbnail_height: Mapped[int | None] = mapped_column(Integer)
 
     kind: Mapped[str] = mapped_column(Text, default="image")
+    # 视频时长（毫秒），照片为 NULL。见 plans/0008。
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
     processing_status: Mapped[str] = mapped_column(Text, default="pending")
     processing_error: Mapped[str | None] = mapped_column(Text)
     face_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -110,6 +112,12 @@ class Face(Base):
     # 浏览模式的人脸小图（160px WebP，入库时从原图按 bbox 裁出）。
     # 可空：003 之前的存量脸用 `jobs face-thumbs` 回填。见 plans/0007。
     thumb: Mapped[bytes | None] = mapped_column(LargeBinary)
+
+    # 视频 tracklet 的出现区间（毫秒），照片行恒为 NULL。见 plans/0008。
+    # tracklet 是「单个视频内一段时间连续出现的脸」，不是「一个人」——
+    # 不做跨视频/跨照片的身份关联（约束 #8）。
+    t_start_ms: Mapped[int | None] = mapped_column(Integer)
+    t_end_ms: Mapped[int | None] = mapped_column(Integer)
 
     model_name: Mapped[str] = mapped_column(Text)
     model_version: Mapped[str] = mapped_column(Text)
