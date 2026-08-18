@@ -37,7 +37,11 @@ class IngestStats:
     albums: int = 0
     processed: int = 0
     skipped_existing: int = 0
+    # 因超长/超大而跳过的视频（正常尺寸的视频自 plans/0008 起会被处理）
     skipped_video: int = 0
+    videos_processed: int = 0
+    video_frames: int = 0
+    video_segments: int = 0
     failed: int = 0
     soft_deleted: int = 0
     faces_added: int = 0
@@ -56,6 +60,9 @@ class IngestStats:
             "processed": self.processed,
             "skipped_existing": self.skipped_existing,
             "skipped_video": self.skipped_video,
+            "videos_processed": self.videos_processed,
+            "video_frames": self.video_frames,
+            "video_segments": self.video_segments,
             "failed": self.failed,
             "soft_deleted": self.soft_deleted,
             "faces_added": self.faces_added,
@@ -144,12 +151,10 @@ async def _ingest_album(
     seen_urls = {a.photo_url for a in assets}
 
     images: list[SourceAsset] = []
+    videos: list[SourceAsset] = []
     for asset in assets:
         if asset.kind == "video":
-            # 第一期不处理视频：抽帧会让计算量和存储上一个量级。
-            # 仍然登记，便于统计视频占比来决定第二期优先级。
-            await _register_skipped(session, asset, reason="video")
-            stats.skipped_video += 1
+            videos.append(asset)
         else:
             images.append(asset)
 
@@ -159,9 +164,30 @@ async def _ingest_album(
         images = [a for a in images if a.photo_url not in already]
         stats.skipped_existing += before - len(images)
 
+        # 视频的终态多一种：因超长/超大被跳过的不再反复下载重试
+        video_done = await _videos_to_skip(session, album, [a.photo_url for a in videos])
+        before = len(videos)
+        videos = [a for a in videos if a.photo_url not in video_done]
+        stats.skipped_existing += before - len(videos)
+
     for batch in _chunk_by_size(images, batch_images, settings.ingest_batch_max_bytes):
         await _process_batch(session, adapter, embedding, settings, album, batch, stats)
         stats.batches += 1
+
+    # 视频逐个处理（单个就是一批帧的量），帧在内部按 batch_images 分块送 GPU
+    for asset in videos:
+        try:
+            await _process_video(
+                session, adapter, embedding, settings, album, asset, stats, batch_images
+            )
+        except EmbeddingServiceError:
+            raise  # 服务级故障不该被当成单个视频失败吞掉
+        except Exception as exc:
+            stats.failed += 1
+            message = f"{asset.filename}: video {type(exc).__name__}: {exc}"
+            stats.errors.append(message)
+            log.warning("video_failed", album=album, error_type=type(exc).__name__)
+            await _mark_failed(session, asset, message)
 
     stats.soft_deleted += await _mark_missing_deleted(session, album, seen_urls)
     await _upsert_sync_state(session, album, started_at, len(seen_urls), full=full)
@@ -392,6 +418,212 @@ async def _replace_faces(
         stats.faces_added += len(face_rows)
 
     stats.processed += len(photo_ids)
+
+
+async def _process_video(
+    session: AsyncSession,
+    adapter: SourceAdapter,
+    embedding: EmbeddingClient,
+    settings: Settings,
+    album: str,
+    asset: SourceAsset,
+    stats: IngestStats,
+    batch_images: int,
+) -> None:
+    """单个视频：下载到临时文件 → 抽帧 → 批量提取 → tracklet 聚合 → 落库。
+
+    帧不是「原图缓存」：临时文件在 finally 里删除，帧 JPEG 随处理释放
+    （只保留各段最清晰帧，出人脸小图用）。见 plans/0008。
+    """
+    import asyncio
+    import tempfile
+    from pathlib import Path
+
+    from jobs.video import TrackletBuilder, probe_duration, sample_frames
+
+    # 源站页面若标了体积，超限的连下载都省了
+    if asset.size_bytes and asset.size_bytes > settings.video_max_bytes:
+        await _register_skipped(session, asset, reason="video_too_big")
+        stats.skipped_video += 1
+        return
+
+    tmp = tempfile.NamedTemporaryFile(  # noqa: SIM115 - 路径要跨 with 块存活
+        suffix=Path(asset.filename).suffix or ".mp4", delete=False
+    )
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    try:
+        size = 0
+        # 本地磁盘的分块写是微秒级的页缓存操作；jobs 是批处理 CLI 不是服务，
+        # 为它引入 aiofiles 不值得
+        with tmp_path.open("wb") as fh:  # noqa: ASYNC230
+            async for chunk in adapter.open_asset(asset):
+                size += len(chunk)
+                if size > settings.video_max_bytes:
+                    await _register_skipped(session, asset, reason="video_too_big")
+                    stats.skipped_video += 1
+                    return
+                fh.write(chunk)
+        stats.bytes_downloaded += size
+
+        info = await asyncio.to_thread(probe_duration, tmp_path)
+        if info.duration_ms > settings.video_max_duration_s * 1000:
+            await _register_skipped(session, asset, reason="video_too_long")
+            stats.skipped_video += 1
+            return
+
+        builder = TrackletBuilder(
+            gap_ms=int(settings.video_track_gap_s * 1000),
+            sim_threshold=settings.video_track_sim,
+            iou_threshold=settings.video_track_iou,
+        )
+        # 各帧的 JPEG 暂存于此；每批后按 builder.referenced_frames() 收缩，
+        # 上限 = tracklet 数 + 1（poster），不随视频长度增长
+        frame_jpegs: dict[int, bytes] = {}
+        poster_jpeg: bytes | None = None
+        discarded = 0
+        frames_total = 0
+
+        # 抽帧是 CPU 解码活，放线程池；主协程消费并分块送 GPU
+        frame_iter = await asyncio.to_thread(
+            lambda: list(
+                sample_frames(tmp_path, settings.video_sample_fps, settings.video_max_frames)
+            )
+        )
+        for i in range(0, len(frame_iter), batch_images):
+            chunk_frames = frame_iter[i : i + batch_images]
+            results = await embedding.extract_batch(
+                [(f"{asset.filename}@{fr.t_ms}", fr.jpeg) for fr in chunk_frames]
+            )
+            for fr, result in zip(chunk_frames, results, strict=True):
+                frames_total += 1
+                if poster_jpeg is None:
+                    poster_jpeg = fr.jpeg
+                if result.error is not None:
+                    # 单帧解码/检测失败不拖垮整个视频，也不值得标 failed 重试
+                    log.warning("video_frame_error", t_ms=fr.t_ms)
+                    continue
+                discarded += result.discarded
+                if result.faces:
+                    frame_jpegs[fr.t_ms] = fr.jpeg
+                    builder.feed(fr.t_ms, result.faces)
+            # 释放不再被引用的帧
+            keep = builder.referenced_frames()
+            frame_jpegs = {t: j for t, j in frame_jpegs.items() if t in keep}
+        frame_iter.clear()
+
+        tracklets = builder.finalize()
+        stats.video_frames += frames_total
+
+        # poster：源站给了缩略图就用，没给用第一帧
+        source_thumb = await adapter.fetch_thumbnail(asset)
+        if source_thumb:
+            thumbnail, thumb_w, thumb_h = source_thumb, None, None
+            stats.thumbs_from_source += 1
+        elif poster_jpeg is not None:
+            data, width, height = make_thumbnail(
+                poster_jpeg, settings.thumb_max_edge, settings.thumb_quality
+            )
+            thumbnail, thumb_w, thumb_h = data, width, height
+            stats.thumbs_generated += 1
+        else:
+            thumbnail, thumb_w, thumb_h = None, None, None
+
+        photo_rows = [
+            {
+                "album": album,
+                "photo_url": asset.photo_url,
+                "thumbnail": thumbnail,
+                "thumbnail_width": thumb_w,
+                "thumbnail_height": thumb_h,
+                "kind": "video",
+                "duration_ms": info.duration_ms or None,
+                "processing_status": "embedded",
+                "processing_error": None,
+                "face_count": len(tracklets),
+                "faces_discarded": discarded,
+                "embedded_at": dt.datetime.now(tz=dt.UTC),
+                "deleted_at": None,
+            }
+        ]
+        url_to_id = await _upsert_photos(session, photo_rows)
+        photo_id = url_to_id[asset.photo_url]
+
+        await session.execute(
+            text("DELETE FROM face WHERE photo_id = :pid"), {"pid": str(photo_id)}
+        )
+        face_rows: list[dict[str, Any]] = []
+        for tr in tracklets:
+            thumb: bytes | None = None
+            best_jpeg = frame_jpegs.get(tr.best_t_ms)
+            if best_jpeg is not None:
+                try:
+                    thumb = crop_face(best_jpeg, tr.best.bbox)
+                except Exception as exc:
+                    log.warning("face_thumb_failed", error_type=type(exc).__name__)
+            face_rows.append(
+                {
+                    "photo_id": photo_id,
+                    "embedding": tr.mean_embedding(),
+                    "bbox_x": tr.best.bbox[0],
+                    "bbox_y": tr.best.bbox[1],
+                    "bbox_w": tr.best.bbox[2],
+                    "bbox_h": tr.best.bbox[3],
+                    "face_px": tr.best.face_px,
+                    "det_score": tr.best.det_score,
+                    "model_name": tr.best.model_name,
+                    "model_version": tr.best.model_version,
+                    "dim": tr.best.dim,
+                    "thumb": thumb,
+                    "t_start_ms": tr.t_start_ms,
+                    "t_end_ms": tr.t_end_ms,
+                }
+            )
+        if face_rows:
+            await session.execute(pg_insert(Face), face_rows)
+        await session.commit()
+
+        stats.videos_processed += 1
+        stats.video_segments += len(face_rows)
+        stats.faces_discarded += discarded
+        log.info(
+            "video_ingested",
+            album=album,
+            frames=frames_total,
+            segments=len(face_rows),
+            duration_ms=info.duration_ms,
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)  # noqa: ASYNC240 —— 同上，本地删文件微秒级
+
+
+async def _videos_to_skip(session: AsyncSession, album: str, urls: list[str]) -> set[str]:
+    """增量模式下不再碰的视频：已入库的，以及因超长/超大被判为终态跳过的。
+
+    与照片不同，视频的「跳过」也算终态 —— 否则每晚定时任务都会白下载一遍
+    超限的大视频。想重新纳入就调大上限后跑 `--full`。
+    """
+    if not urls:
+        return set()
+    rows = (
+        await session.execute(
+            text(
+                """
+                SELECT photo_url FROM photo
+                WHERE album = :album
+                  AND deleted_at IS NULL
+                  AND photo_url = ANY(CAST(:urls AS text[]))
+                  AND (
+                        processing_status = 'embedded'
+                     OR (processing_status = 'skipped'
+                         AND processing_error IN ('video_too_long', 'video_too_big'))
+                  )
+                """
+            ),
+            {"album": album, "urls": urls},
+        )
+    ).all()
+    return {row.photo_url for row in rows}
 
 
 async def _already_embedded(session: AsyncSession, album: str, urls: list[str]) -> set[str]:

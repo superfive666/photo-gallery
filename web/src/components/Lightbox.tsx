@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 
 import type { Match } from '../api'
+import { formatMs, seekUrl } from '../lib/time'
 
 /**
  * 大图查看。缩略图只有 256px，所以这里不放大缩略图 ——
@@ -65,11 +66,34 @@ export function Lightbox({
         {match.thumb_url && (
           <img
             src={match.thumb_url}
-            alt={`${match.album} 的照片`}
+            alt={`${match.album} 的${match.kind === 'video' ? '视频' : '照片'}`}
             className="max-h-full max-w-full rounded-xl object-contain"
           />
         )}
       </div>
+
+      {/* 视频命中：列出这个人出现的时间段，点哪段就从哪段开始播（#t= 原生跳转） */}
+      {match.kind === 'video' && match.segments.length > 0 && (
+        <section aria-label="出现时段" className="space-y-2 px-4 pb-1">
+          <p className="text-ink-600 text-xs">
+            在视频中出现 {match.segments.length} 段，点击从该时间点开始播放
+          </p>
+          <ul className="flex flex-wrap gap-2">
+            {match.segments.map((seg) => (
+              <li key={seg.start_ms}>
+                <a
+                  href={seekUrl(match.original_url, seg.start_ms)}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                  className="bg-ink-900 hover:bg-ink-800 text-ink-200 inline-block rounded-full px-4 py-3 font-mono text-xs transition-colors"
+                >
+                  {formatMs(seg.start_ms)}–{formatMs(seg.end_ms)}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       <footer className="flex items-center justify-between gap-3 px-4 py-4">
         <button
@@ -82,12 +106,16 @@ export function Lightbox({
         </button>
 
         <a
-          href={match.original_url}
+          href={
+            match.kind === 'video' && match.segments[0]
+              ? seekUrl(match.original_url, match.segments[0].start_ms)
+              : match.original_url
+          }
           target="_blank"
           rel="noreferrer noopener"
           className="bg-accent-500 hover:bg-accent-600 rounded-lg px-4 py-2 text-sm font-medium transition-colors"
         >
-          查看原图
+          {match.kind === 'video' ? '播放视频' : '查看原图'}
         </a>
 
         <button

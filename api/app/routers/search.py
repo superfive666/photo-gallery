@@ -27,7 +27,7 @@ from api.app.deps import (
     SessionDep,
     SettingsDep,
 )
-from api.app.services.search import search_by_embedding
+from api.app.services.search import PhotoMatch, search_by_embedding
 from gallery_core.config import Settings
 from gallery_core.embedding_client import EmbeddingServiceError
 from gallery_core.logging import get_logger
@@ -38,12 +38,38 @@ log = get_logger(__name__)
 router = APIRouter(prefix="/search", tags=["search"])
 
 
+class SegmentOut(BaseModel):
+    # 命中人脸在视频里的出现区间（毫秒）。前端用 original_url + #t= 跳转
+    start_ms: int
+    end_ms: int
+    score: float
+
+
 class MatchOut(BaseModel):
     photo_id: str
     album: str
     score: float
     thumb_url: str | None
     original_url: str
+    kind: str = "image"  # image | video
+    duration_ms: int | None = None
+    # 仅视频：出现时间段（相邻段已合并）。照片恒为空列表
+    segments: list[SegmentOut] = []
+
+
+def _match_out(m: PhotoMatch) -> MatchOut:
+    return MatchOut(
+        photo_id=str(m.photo_id),
+        album=m.album,
+        score=round(m.score, 4),
+        thumb_url=f"/api/photos/{m.photo_id}/thumb" if m.has_thumbnail else None,
+        original_url=f"/api/photos/{m.photo_id}/original",
+        kind=m.kind,
+        duration_ms=m.duration_ms,
+        segments=[
+            SegmentOut(start_ms=s.start_ms, end_ms=s.end_ms, score=s.score) for s in m.segments
+        ],
+    )
 
 
 class SearchOut(BaseModel):
@@ -132,16 +158,7 @@ async def search(
         latency_ms,
     )
 
-    matches = [
-        MatchOut(
-            photo_id=str(m.photo_id),
-            album=m.album,
-            score=round(m.score, 4),
-            thumb_url=f"/api/photos/{m.photo_id}/thumb" if m.has_thumbnail else None,
-            original_url=f"/api/photos/{m.photo_id}/original",
-        )
-        for m in outcome.matches
-    ]
+    matches = [_match_out(m) for m in outcome.matches]
 
     # 只记计数与耗时
     log.info(
@@ -216,16 +233,7 @@ async def search_by_face(
         latency_ms,
     )
 
-    matches = [
-        MatchOut(
-            photo_id=str(m.photo_id),
-            album=m.album,
-            score=round(m.score, 4),
-            thumb_url=f"/api/photos/{m.photo_id}/thumb" if m.has_thumbnail else None,
-            original_url=f"/api/photos/{m.photo_id}/original",
-        )
-        for m in outcome.matches
-    ]
+    matches = [_match_out(m) for m in outcome.matches]
 
     log.info(
         "face_search_done",

@@ -88,6 +88,20 @@ class Settings(BaseSettings):
     thumb_max_edge: int = 256
     thumb_quality: int = 75
 
+    # --- 视频建库（plans/0008）---
+    # 抽帧频率。1 fps 足够定位「哪段有他」；短于 1 秒的一闪而过会漏（已知取舍）。
+    video_sample_fps: float = 1.0
+    # 超长视频的保护上限：超时长跳过、超帧数截断（先到者生效）
+    video_max_duration_s: int = 1800
+    video_max_frames: int = 1800
+    # 下载体积上限（字节）。超过直接跳过，防单个大文件拖垮任务
+    video_max_bytes: int = 2 * 1024 * 1024 * 1024
+    # tracklet 聚合：连续 gap 秒没有新帧并入即封段
+    video_track_gap_s: float = 3.0
+    # 跨帧关联的判据：余弦相似度（主）与 bbox IoU（辅），满足其一即并入
+    video_track_sim: float = 0.6
+    video_track_iou: float = 0.3
+
     # --- 其他 ---
     log_level: str = "INFO"
     schema_dir: str = "docs/schema"

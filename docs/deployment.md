@@ -424,6 +424,13 @@ docker compose run --rm jobs python -m jobs face-thumbs          # 全部相册
 docker compose run --rm jobs python -m jobs face-thumbs --album 2026-08-10
 ```
 
+**视频**（plans/0008）自动纳入：此前被登记为「跳过」的视频会在下一次增量
+ingest 时自动处理（1 fps 抽帧、走 GPU，10 分钟视频约 20–30 秒），不需要 `--full`：
+
+```bash
+docker compose run --rm jobs python -m jobs ingest --album 2026-08-15
+```
+
 `COMPOSE_FILE` 写在 `.env` 里而不是每次加 `-f`：这样 workflow、`make up`、
 手敲的 `docker compose ps` 全都自动带上 GPU 叠加层，不会出现「手动起的没挂 GPU」
 这种只在事后从日志里才发现的偏差。
