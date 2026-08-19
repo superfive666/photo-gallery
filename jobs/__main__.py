@@ -485,8 +485,10 @@ async def cmd_media_ingest(args: argparse.Namespace) -> int:
     s = get_settings()
     adapter = None if args.local_only else build_adapter()
     try:
-        async with ClipClient() as clip, session_scope() as session:
-            stats = await ingest_album_media(session, s, clip, args.album, adapter)
+        # 不在这里开 session：建库的长活（下载/拆条）以小时计，攥着连接会被掐掉。
+        # 写库的短事务由 ingest_album_media 内部按素材粒度自行管理。
+        async with ClipClient() as clip:
+            stats = await ingest_album_media(s, clip, args.album, adapter)
     finally:
         if adapter is not None and hasattr(adapter, "aclose"):
             await adapter.aclose()
