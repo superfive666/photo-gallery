@@ -25,27 +25,9 @@ from gallery_core.config import get_settings
 from gallery_core.db import get_engine, session_scope
 from gallery_core.embedding_client import EmbeddingClient, EmbeddingServiceError
 from gallery_core.logging import configure_logging, get_logger
-from jobs.sources.base import SourceAdapter
+from jobs.sources import build_adapter
 
 log = get_logger(__name__)
-
-
-def build_adapter() -> SourceAdapter:
-    """按 SOURCE_ADAPTER 选择源站实现。"""
-    s = get_settings()
-    if s.source_adapter == "local_dir":
-        from jobs.sources.local_dir import LocalDirAdapter
-
-        return LocalDirAdapter(s.source_local_dir)
-
-    from jobs.sources.static_gallery import StaticGalleryAdapter
-
-    return StaticGalleryAdapter(
-        base_url=s.source_base_url,
-        user_agent=s.source_user_agent,
-        concurrency=s.source_concurrency,
-        rate_limit_per_second=s.source_rate_limit_per_second,
-    )
 
 
 async def cmd_migrate(_args: argparse.Namespace) -> int:
@@ -308,22 +290,31 @@ async def cmd_invite(args: argparse.Namespace) -> int:
     from gallery_core.models import InviteCode
 
     if args.invite_command == "create":
+        if args.role == "edit" and not args.album:
+            # 一码一相册是剪辑域的硬语义：拿到码 = 拿到用这个相册剪辑的权限
+            print("剪辑码必须绑定相册：--role edit 时 --album 必填", file=sys.stderr)
+            return 2
         full_code, prefix, code_hash = generate_invite_code()
         async with session_scope() as session:
-            session.add(
-                InviteCode(
-                    prefix=prefix,
-                    code_hash=code_hash,
-                    album=args.album,
-                    label=args.label,
-                )
+            invite = InviteCode(
+                prefix=prefix,
+                code_hash=code_hash,
+                album=args.album,
+                role=args.role,
+                label=args.label,
             )
+            session.add(invite)
+            await session.flush()
+            workspace_id = str(invite.id)
         print(
             json.dumps(
                 {
                     "invite_code": full_code,
                     "prefix": prefix,
                     "album": args.album,
+                    "role": args.role,
+                    # 剪辑码的工作区 id：项目/成片都挂在它下面，排查数据归属用
+                    "workspace_id": workspace_id if args.role == "edit" else None,
                     "label": args.label,
                 },
                 ensure_ascii=False,
@@ -351,6 +342,7 @@ async def cmd_invite(args: argparse.Namespace) -> int:
                     {
                         "prefix": r.prefix,
                         "album": r.album,
+                        "role": r.role,
                         "label": r.label,
                         "disabled": r.disabled_at is not None,
                         "created_at": r.created_at.isoformat(),
@@ -467,6 +459,49 @@ async def cmd_face_thumbs(args: argparse.Namespace) -> int:
     return 1 if failed_photos else 0
 
 
+async def cmd_filters_import(args: argparse.Namespace) -> int:
+    """滤镜库导入：内置预设 + 目录下的 .cube 模版。幂等，可反复执行。"""
+    from jobs.filters import disable_filter, import_filters
+
+    s = get_settings()
+    if args.disable:
+        async with session_scope() as session:
+            found = await disable_filter(session, args.disable)
+        print(json.dumps({"disabled": args.disable, "found": found}, ensure_ascii=False))
+        return 0 if found else 1
+
+    luts_dir = Path(args.dir or s.luts_dir())
+    async with session_scope() as session:
+        stats = await import_filters(session, luts_dir)
+    print(json.dumps(stats.as_dict(), ensure_ascii=False, indent=2))
+    return 1 if stats.rejected and not (stats.imported or stats.updated) else 0
+
+
+async def cmd_media_ingest(args: argparse.Namespace) -> int:
+    """剪辑素材建库（手动预热）。视频多的相册建议提前跑，用户体验就是秒开。"""
+    from gallery_core.clip_client import ClipClient
+    from jobs.media_ingest import ingest_album_media
+
+    s = get_settings()
+    adapter = None if args.local_only else build_adapter()
+    try:
+        async with ClipClient() as clip, session_scope() as session:
+            stats = await ingest_album_media(session, s, clip, args.album, adapter)
+    finally:
+        if adapter is not None and hasattr(adapter, "aclose"):
+            await adapter.aclose()
+    print(json.dumps(stats.as_dict(), ensure_ascii=False, indent=2))
+    return 1 if stats.failed else 0
+
+
+async def cmd_worker(_args: argparse.Namespace) -> int:
+    """常驻 worker：认领并执行剪辑域任务（建库/解析检索/渲染/滤镜导入）。"""
+    from jobs.worker import run_forever
+
+    await run_forever()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="jobs", description="离线建库与运维任务")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -499,12 +534,30 @@ def main(argv: list[str] | None = None) -> int:
     p_inv_create = invite_sub.add_parser("create", help="发一张新码（完整码只显示一次）")
     p_inv_create.add_argument("--album", default=None, help="绑定的相册 slug；省略 = 全相册管理码")
     p_inv_create.add_argument("--label", default=None, help="备注：发给谁 / 用途")
+    p_inv_create.add_argument(
+        "--role",
+        choices=["search", "edit"],
+        default="search",
+        help="search=查照片（默认）；edit=剪辑聊天窗（必须绑相册，一码一相册）",
+    )
     invite_sub.add_parser("list", help="列出全部邀请码（只有 prefix，没有完整码）")
     p_inv_disable = invite_sub.add_parser("disable", help="吊销一张码")
     p_inv_disable.add_argument("--prefix", required=True, help="要吊销的码的 prefix（8 位 hex）")
 
     p_ft = sub.add_parser("face-thumbs", help="回填存量人脸小图（只下载原图裁剪，不动 GPU）")
     p_ft.add_argument("--album", default=None, help="只处理指定相册；省略则处理全部")
+
+    p_filters = sub.add_parser("filters-import", help="导入滤镜库（内置预设 + LUT 目录）")
+    p_filters.add_argument("--dir", default=None, help="LUT 目录，默认 {MEDIA_ROOT}/luts")
+    p_filters.add_argument("--disable", default=None, help="软下架指定 slug（不删行）")
+
+    p_media = sub.add_parser("media-ingest", help="剪辑素材建库（下载原片 + 拆条 + 向量化）")
+    p_media.add_argument("--album", required=True, help="相册 slug")
+    p_media.add_argument(
+        "--local-only", action="store_true", help="不访问源站，只处理已在 media 目录里的文件"
+    )
+
+    sub.add_parser("worker", help="常驻 worker：认领并执行剪辑域任务")
 
     args = parser.parse_args(argv)
     configure_logging(get_settings().log_level)
@@ -517,6 +570,9 @@ def main(argv: list[str] | None = None) -> int:
         "block": cmd_block,
         "invite": cmd_invite,
         "face-thumbs": cmd_face_thumbs,
+        "filters-import": cmd_filters_import,
+        "media-ingest": cmd_media_ingest,
+        "worker": cmd_worker,
     }
     return asyncio.run(handlers[args.command](args))
 

@@ -16,6 +16,8 @@ dependencies = [
     # 见根 pyproject 的 override-dependencies：insightface 带的是非 headless 版，已摘掉
     "opencv-python-headless>=4.10",
     "pillow>=11.1",
+    # Chinese-CLIP 文本塔的 BERT 分词（纯 Rust 实现，不引入 torch/transformers）
+    "tokenizers>=0.20",
 ]
 
 # ⚠️ GPU 推理不在这份锁文件里，这是**有意的**。

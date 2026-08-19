@@ -108,7 +108,7 @@ mypy_path = "."
 
 # 第三方库缺 stub 的不阻塞
 [[tool.mypy.overrides]]
-module = ["insightface.*", "cv2.*", "onnxruntime.*", "lxml.*"]
+module = ["insightface.*", "cv2.*", "onnxruntime.*", "lxml.*", "scenedetect.*", "tokenizers.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

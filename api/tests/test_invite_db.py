@@ -13,7 +13,7 @@ from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from api.app.auth import generate_invite_code
+from api.app.auth import ROLE_EDIT, ROLE_SEARCH, generate_invite_code
 from api.app.routers.session import _resolve_invite
 from gallery_core.config import Settings
 from gallery_core.models import InviteCode
@@ -49,7 +49,8 @@ async def test_scoped_code_resolves_to_bound_album() -> None:
         session.add(InviteCode(prefix=prefix, code_hash=code_hash, album="2026-08-10"))
         await session.commit()
         try:
-            assert await _resolve_invite(full, session, SETTINGS) == "2026-08-10"
+            resolved = await _resolve_invite(full, session, SETTINGS)
+            assert resolved == ("2026-08-10", ROLE_SEARCH, None)
             # secret 错 → 401
             with pytest.raises(HTTPException) as exc_info:
                 await _resolve_invite(f"{prefix}.wrong-secret", session, SETTINGS)
@@ -91,3 +92,21 @@ async def test_unknown_prefix_rejected() -> None:
 
     await _with_session(run)
     del prefix
+
+
+async def test_edit_code_resolves_role_and_workspace() -> None:
+    """剪辑码（005 迁移的 role 列）：返回 (相册, edit, workspace_id=行 id)。"""
+    full, prefix, code_hash = generate_invite_code()
+
+    async def run(session: AsyncSession) -> None:
+        invite = InviteCode(prefix=prefix, code_hash=code_hash, album="2026-08-10", role="edit")
+        session.add(invite)
+        await session.commit()
+        try:
+            album, role, wid = await _resolve_invite(full, session, SETTINGS)
+            assert (album, role) == ("2026-08-10", ROLE_EDIT)
+            assert wid == str(invite.id)
+        finally:
+            await _cleanup(session, prefix)
+
+    await _with_session(run)

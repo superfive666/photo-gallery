@@ -45,6 +45,11 @@ _hasher = PasswordHasher()
 
 _PREFIX_RE = re.compile(r"^[0-9a-f]{8}$")
 
+# 角色：search（查照片，现状）| edit（剪辑聊天窗，一码一相册）。
+# 存在 invite_code.role 上；两个角色的能力面完全隔离（互不越权）。
+ROLE_SEARCH = "search"
+ROLE_EDIT = "edit"
+
 
 @dataclass(frozen=True, slots=True)
 class SessionInfo:
@@ -122,22 +127,31 @@ def issue_session(
     settings: Settings,
     album: str | None = None,
     device: str | None = None,
+    role: str = ROLE_SEARCH,
+    workspace_id: str | None = None,
 ) -> str:
     """签发 session + CSRF 两个 cookie，返回 session id。
 
     album 进 JWT 的 `alb` claim：检索的相册边界由它决定，服务端强制执行。
     device 进 `dev` claim：设备限流的键，见 SessionInfo 的说明。
+    剪辑角色额外带 `wid`（= invite_code 行 id，工作区身份）：同一个码在任何设备
+    登录都落到同一个 workspace —— 断点恢复的身份基础。cookie 只是钥匙，
+    状态全部在服务端。
     """
     session_id = uuid.uuid4().hex
     now = dt.datetime.now(tz=dt.UTC)
+    claims: dict[str, Any] = {
+        "sid": session_id,
+        "alb": album,
+        "dev": device or secrets.token_hex(16),
+        "role": role,
+        "iat": int(now.timestamp()),
+        "exp": int((now + dt.timedelta(hours=settings.session_ttl_hours)).timestamp()),
+    }
+    if role == ROLE_EDIT:
+        claims["wid"] = workspace_id
     token = jwt.encode(
-        {
-            "sid": session_id,
-            "alb": album,
-            "dev": device or secrets.token_hex(16),
-            "iat": int(now.timestamp()),
-            "exp": int((now + dt.timedelta(hours=settings.session_ttl_hours)).timestamp()),
-        },
+        claims,
         settings.jwt_secret,
         algorithm="HS256",
     )
@@ -186,7 +200,47 @@ def require_session(request: Request, settings: Settings) -> SessionInfo:
     album = payload.get("alb")
     if album is not None and not isinstance(album, str):
         raise HTTPException(status_code=401, detail="会话无效")
+    # 剪辑码的 token 不能调查找接口（互不越权）。无 role 的存量 token 按 search。
+    if payload.get("role", ROLE_SEARCH) != ROLE_SEARCH:
+        raise HTTPException(status_code=403, detail="剪辑邀请码不能使用查找功能")
     return SessionInfo(sid=sid, album=album, dev=dev)
+
+
+@dataclass(frozen=True, slots=True)
+class EditSession:
+    """剪辑会话：workspace_id 即 invite_code 行 id，album 是该码绑定的唯一相册。"""
+
+    sid: str
+    workspace_id: uuid.UUID
+    album: str
+    dev: str
+
+
+def require_edit_session(request: Request, settings: Settings) -> EditSession:
+    """校验剪辑类 session。查找码的 token 调剪辑接口 → 403（互不越权）。"""
+    token = request.cookies.get(SESSION_COOKIE)
+    if not token:
+        raise HTTPException(status_code=401, detail="需要邀请码")
+    try:
+        payload: dict[str, Any] = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
+    except jwt.PyJWTError as exc:
+        raise HTTPException(status_code=401, detail="会话已失效，请重新输入邀请码") from exc
+    if payload.get("role", ROLE_SEARCH) != ROLE_EDIT:
+        raise HTTPException(status_code=403, detail="需要剪辑邀请码")
+    sid, dev = payload.get("sid"), payload.get("dev")
+    wid, album = payload.get("wid"), payload.get("alb")
+    if (
+        not isinstance(sid, str)
+        or not isinstance(dev, str)
+        or not isinstance(wid, str)
+        or not isinstance(album, str)
+    ):
+        raise HTTPException(status_code=401, detail="会话已失效，请重新输入邀请码")
+    try:
+        workspace_id = uuid.UUID(wid)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="会话已失效，请重新输入邀请码") from exc
+    return EditSession(sid=sid, workspace_id=workspace_id, album=album, dev=dev)
 
 
 # ------------------------------------------------------------------ CSRF / 设备

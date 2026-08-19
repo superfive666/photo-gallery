@@ -37,7 +37,16 @@ services:
       EMBEDDING_USE_GPU: ${EMBEDDING_USE_GPU:-false}
       REC_BATCH_SIZE: ${REC_BATCH_SIZE:-64}
       MAX_BATCH_IMAGES: ${MAX_BATCH_IMAGES:-32}
+      # 剪辑域：Chinese-CLIP 双塔。模型文件缺失时服务照常启动（clip_loaded=false），
+      # 人脸功能不受影响。导出方法见 docs/media-edit.md。
+      CLIP_MODEL_DIR: /opt/clip
+      CLIP_MODEL_NAME: ${CLIP_MODEL_NAME:-chinese-clip-vit-b-16}
+      CLIP_MODEL_VERSION: ${CLIP_MODEL_VERSION:-1}
       LOG_LEVEL: ${LOG_LEVEL}
+    volumes:
+      # CLIP 模型文件（image.onnx / text.onnx / vocab.txt）从宿主机挂入，
+      # 不打进镜像 —— 它是可选能力，且换模型不应该要求重建镜像。
+      - ${CLIP_MODEL_DIR_HOST:-./clip-model}:/opt/clip:ro
     expose:
       - "8000"
     # 推理是 CPU 密集的，限额避免它把整台机器吃满导致 api 无响应
@@ -61,6 +70,11 @@ services:
       dockerfile: docker/Dockerfile.api
     restart: unless-stopped
     env_file: .env
+    volumes:
+      # 剪辑域：只读挂 output 分发成片 zip；agent-prompts 提示词热覆盖（可选）。
+      # api 不挂 media —— 原片只有 jobs/worker 需要碰。
+      - ${MEDIA_ROOT_HOST:-./photo-gallery-data}/output:/photo-gallery/output:ro
+      - ${MEDIA_ROOT_HOST:-./photo-gallery-data}/agent-prompts:/photo-gallery/agent-prompts:ro
     # 数据库在宿主机上，容器里用 host.docker.internal 访问它。
     # host-gateway 由 docker 解析成宿主机在 docker0 网桥上的地址 ——
     # 前提是宿主机 pg 的 listen_addresses 和 pg_hba 放行了 docker 网段，
@@ -114,4 +128,31 @@ services:
       # local_dir adapter 与评估集的输入目录
       - ${SOURCE_LOCAL_DIR:-./sample-albums}:/data/sample-albums:ro
       - ${EVAL_DIR:-./eval}:/data/eval:ro
+      # 剪辑域专用盘：media/<album> 原片、output/<workspace> 成片、luts 滤镜导入目录。
+      # 人脸建库的原图依旧不落盘 —— 这个卷只属于剪辑域。
+      - ${MEDIA_ROOT_HOST:-./photo-gallery-data}:/photo-gallery
       # 原图不落盘：批量推理把字节留在内存里，处理完即释放。所以这里没有原图缓存卷。
+
+  # 剪辑域常驻 worker：认领 job_run 队列（建库/解析检索/渲染/滤镜导入）。
+  # 与 jobs 同一镜像，只是换了入口命令并常驻运行。
+  worker:
+    image: ${IMAGE_PREFIX:-photo-gallery}-jobs:${IMAGE_TAG:-dev}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.jobs
+    restart: unless-stopped
+    command: ["python", "-m", "jobs", "worker"]
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      embedding:
+        condition: service_healthy
+    volumes:
+      - ${MEDIA_ROOT_HOST:-./photo-gallery-data}:/photo-gallery
+    # 拆条与渲染是 CPU 密集的，限额避免它把 api/embedding 挤死
+    deploy:
+      resources:
+        limits:
+          cpus: "${WORKER_CPU_LIMIT:-4}"
+          memory: 6g

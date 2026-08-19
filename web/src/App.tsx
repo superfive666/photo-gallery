@@ -18,6 +18,7 @@ import { InviteGate } from './components/InviteGate'
 import { Lightbox } from './components/Lightbox'
 import { ResultGrid } from './components/ResultGrid'
 import { SelfieUploader, type SelfieItem } from './components/SelfieUploader'
+import { EditApp } from './EditApp'
 
 type AuthState = 'checking' | 'anonymous' | 'authenticated'
 // 两种检索方式：上传自拍，或浏览相册后点选照片上的脸
@@ -28,6 +29,8 @@ export function App() {
   // 邀请码绑定的相册。非 null 时检索被后端硬性限制在这一个相册里，
   // 前端只是如实展示这个边界，不承担安全职责。
   const [scope, setScope] = useState<string | null>(null)
+  // 剪辑码登录后走聊天窗 UI（一码一相册）；null = 查找码，走下面的检索 UI
+  const [editAlbum, setEditAlbum] = useState<string | null>(null)
   const [mode, setMode] = useState<Mode>('selfie')
   const [albums, setAlbums] = useState<Album[]>([])
   const [album, setAlbum] = useState('')
@@ -39,21 +42,25 @@ export function App() {
   const [pending, setPending] = useState(false)
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null)
 
-  useEffect(() => {
-    // 先问一次 /session/me，避免每次刷新都弹邀请码框
-    void checkSession().then((session) => {
-      setScope(session.album)
-      setAuth(session.authenticated ? 'authenticated' : 'anonymous')
-    })
+  const syncSession = useCallback(async () => {
+    // 先问一次 /session/me，避免每次刷新都弹邀请码框；同时拿角色决定走哪套 UI
+    const session = await checkSession()
+    setScope(session.album)
+    setEditAlbum(session.role === 'edit' && session.album ? session.album : null)
+    setAuth(session.authenticated ? 'authenticated' : 'anonymous')
   }, [])
 
   useEffect(() => {
-    if (auth !== 'authenticated') return
+    void syncSession()
+  }, [syncSession])
+
+  useEffect(() => {
+    if (auth !== 'authenticated' || editAlbum !== null) return
     // 相册列表拿不到不影响主流程（默认「所有活动」），所以失败静默
     void listAlbums()
       .then(setAlbums)
       .catch(() => setAlbums([]))
-  }, [auth])
+  }, [auth, editAlbum])
 
   const runSearch = useCallback(async () => {
     setPending(true)
@@ -113,10 +120,19 @@ export function App() {
   if (auth === 'anonymous') {
     return (
       <InviteGate
-        onAuthenticated={(scopedAlbum) => {
-          setScope(scopedAlbum)
-          setAuth('authenticated')
+        onAuthenticated={() => {
+          // 重新问一次 /me：登录响应里有 album，但 role 决定走哪套 UI，统一以 /me 为准
+          void syncSession()
         }}
+      />
+    )
+  }
+
+  if (editAlbum !== null) {
+    return (
+      <EditApp
+        album={editAlbum}
+        onLogout={() => void logout().then(() => void syncSession())}
       />
     )
   }

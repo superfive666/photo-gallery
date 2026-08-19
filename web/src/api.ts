@@ -32,10 +32,14 @@ export interface Captcha {
   svg: string
 }
 
+export type SessionRole = 'search' | 'edit'
+
 export interface SessionState {
   authenticated: boolean
   // 本 session 绑定的相册；null = 可搜全部相册
   album: string | null
+  // search = 自拍检索 UI；edit = 剪辑聊天窗（一码一相册）
+  role: SessionRole
 }
 
 export type SearchStatus = 'ok' | 'no_face' | 'no_match'
@@ -79,7 +83,7 @@ async function parseError(response: Response): Promise<never> {
  * 这里读出来回填到 X-CSRF-Token 头。跨站攻击者发得出请求但读不到 cookie，
  * 所以头对得上就证明请求来自本站页面。
  */
-function csrfHeaders(): Record<string, string> {
+export function csrfHeaders(): Record<string, string> {
   const token = document.cookie.match(/(?:^|;\s*)zrc_csrf=([^;]+)/)?.[1]
   return token ? { 'X-CSRF-Token': token } : {}
 }
@@ -109,15 +113,29 @@ export async function login(
     }),
   })
   if (!response.ok) await parseError(response)
-  const body = (await response.json()) as { album?: string | null }
-  return { authenticated: true, album: body.album ?? null }
+  const body = (await response.json()) as { album?: string | null; role?: string }
+  return {
+    authenticated: true,
+    album: body.album ?? null,
+    role: body.role === 'edit' ? 'edit' : 'search',
+  }
 }
 
 export async function checkSession(): Promise<SessionState> {
+  const fallback: SessionState = { authenticated: false, album: null, role: 'search' }
   const response = await fetch(`${BASE}/session/me`, { credentials: 'same-origin' })
-  if (!response.ok) return { authenticated: false, album: null }
-  const body = (await response.json()) as { authenticated?: boolean; album?: string | null }
-  return { authenticated: body.authenticated === true, album: body.album ?? null }
+  if (!response.ok) return fallback
+  const body = (await response.json()) as {
+    authenticated?: boolean
+    album?: string | null
+    role?: string
+  }
+  if (body.authenticated !== true) return fallback
+  return {
+    authenticated: true,
+    album: body.album ?? null,
+    role: body.role === 'edit' ? 'edit' : 'search',
+  }
 }
 
 export async function logout(): Promise<void> {

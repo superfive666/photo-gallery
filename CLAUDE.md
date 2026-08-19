@@ -8,16 +8,19 @@
 
 ## 架构速览
 
-四个容器（`docker compose` 编排）+ 宿主机数据库：
+五个容器（`docker compose` 编排）+ 宿主机数据库：
 
 - **数据库不在 compose 里**：生产连宿主机上已有的 Postgres 16 + pgvector
   （`DATABASE_URL` 指向 `host.docker.internal`），唯一状态所在地。
   本地开发可叠加 `docker-compose.localdb.yml` 起一个容器化 pg。
-- `embedding` — FastAPI + InsightFace buffalo_l（ONNXRuntime，CPU 或 CUDA），**唯一**做人脸
-  检测/embedding 的地方。`/extract` 单张（在线检索）、`/extract/batch` 批量（离线建库）
-- `api` — FastAPI，鉴权 + 检索 + 缩略图分发，不含模型
-- `web` — nginx 托管 Vite 构建产物
+- `embedding` — FastAPI + InsightFace buffalo_l + Chinese-CLIP（ONNXRuntime，CPU 或 CUDA），
+  **唯一**做人脸与图文向量化的地方。`/extract`(/batch) 人脸；`/clip/text`、
+  `/clip/image/batch` 图文（剪辑域）
+- `api` — FastAPI，鉴权 + 检索 + 缩略图分发 + 剪辑域接口与 agent 框架，不含模型
+- `web` — nginx 托管 Vite 构建产物（查找 UI + 剪辑聊天窗）
 - `jobs` — 一次性容器 / cron 触发，离线建库
+- `worker` — jobs 镜像的常驻模式，认领剪辑域任务（下载建库/解析检索/渲染），
+  见 docs/media-edit.md
 
 ## 不可违反的约束
 
