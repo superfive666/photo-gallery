@@ -45,8 +45,9 @@ async def _run_media_ingest(settings: Settings, job: JobRun) -> dict[str, Any]:
     album = job.album or ""
     adapter = build_adapter()
     try:
-        async with ClipClient() as clip, session_scope() as session:
-            stats = await ingest_album_media(session, settings, clip, album, adapter)
+        # 同 CLI：长活不占连接，写库短事务由 ingest_album_media 内部管理
+        async with ClipClient() as clip:
+            stats = await ingest_album_media(settings, clip, album, adapter)
     finally:
         aclose = getattr(adapter, "aclose", None)
         if aclose is not None:
@@ -100,8 +101,10 @@ async def _run_render(settings: Settings, job: JobRun) -> dict[str, Any]:
     # 照片不落盘（006 迁移）：渲染时按 source_url 现下载，需要源站 adapter
     adapter = build_adapter()
     try:
+        # 渲染不占连接（ffmpeg 以分钟计，攥着连接会被掐），读写都在 render_project
+        # 内部的短事务里完成；这里只在结束后用一个短事务置状态、记事件。
+        result = await render_project(settings, project_id, adapter)
         async with session_scope() as session:
-            result = await render_project(session, settings, project_id, adapter)
             project = await session.get(EditProject, project_id)
             assert project is not None
             project.status = "done"
