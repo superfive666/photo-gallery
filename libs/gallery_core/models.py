@@ -248,7 +248,9 @@ class MediaAsset(Base):
     id: Mapped[uuid.UUID] = _uuid7_pk()
     album: Mapped[str] = mapped_column(ALBUM_TYPE)
     source_url: Mapped[str] = mapped_column(Text, unique=True)
-    path: Mapped[str] = mapped_column(Text)
+    # 本地落盘路径。NULL = 远端照片（分析在内存完成，渲染时按 source_url 现下载）；
+    # 非 NULL = 本地文件（视频必须落盘：拆条与 ffmpeg 剪裁要随机访问）。见 006 迁移。
+    path: Mapped[str | None] = mapped_column(Text)
     kind: Mapped[str] = mapped_column(Text, default="image")
 
     duration_ms: Mapped[int | None] = mapped_column(Integer)

@@ -160,12 +160,20 @@ def sample_gray_frames(
     return frames
 
 
-def image_keyframe(path: Path) -> tuple[bytes, int, int, int, int]:
-    """照片：读原图，产出关键帧缩略图。返回 (jpeg, thumb_w, thumb_h, 原宽, 原高)。"""
-    with Image.open(path) as src:
+def image_keyframe_bytes(data: bytes) -> tuple[bytes, int, int, int, int]:
+    """照片字节 → 关键帧缩略图。返回 (jpeg, thumb_w, thumb_h, 原宽, 原高)。
+
+    接受字节而不是路径：远端照片不落盘，分析在内存中完成（见 006 迁移）。
+    """
+    with Image.open(io.BytesIO(data)) as src:
         from PIL import ImageOps
 
         oriented = ImageOps.exif_transpose(src) or src
         rgb = np.asarray(oriented.convert("RGB"), dtype=np.uint8)
     payload, w, h = _encode_jpeg(rgb, _KEYFRAME_MAX_EDGE, _KEYFRAME_JPEG_QUALITY)
     return payload, w, h, rgb.shape[1], rgb.shape[0]
+
+
+def image_keyframe(path: Path) -> tuple[bytes, int, int, int, int]:
+    """本地照片文件的关键帧（手动预拷入的素材走这条）。"""
+    return image_keyframe_bytes(path.read_bytes())

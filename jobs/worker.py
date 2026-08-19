@@ -94,11 +94,14 @@ async def _run_project_flow(settings: Settings, job: JobRun) -> dict[str, Any]:
 async def _run_render(settings: Settings, job: JobRun) -> dict[str, Any]:
     from api.app.services.edit_flow import append_event
     from jobs.render import render_project
+    from jobs.sources import build_adapter
 
     project_id = uuid.UUID(str(job.params["project_id"]))
+    # 照片不落盘（006 迁移）：渲染时按 source_url 现下载，需要源站 adapter
+    adapter = build_adapter()
     try:
         async with session_scope() as session:
-            result = await render_project(session, settings, project_id)
+            result = await render_project(session, settings, project_id, adapter)
             project = await session.get(EditProject, project_id)
             assert project is not None
             project.status = "done"
@@ -112,6 +115,10 @@ async def _run_render(settings: Settings, job: JobRun) -> dict[str, Any]:
     except Exception as exc:
         await _fail_project(project_id, f"{type(exc).__name__}: {exc}")
         raise
+    finally:
+        aclose = getattr(adapter, "aclose", None)
+        if aclose is not None:
+            await aclose()
     return {k: v for k, v in result.items() if k != "bytes"} | {"bytes": result["bytes"]}
 
 
