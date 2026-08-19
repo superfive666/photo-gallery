@@ -34,6 +34,7 @@ from gallery_core.models import (
     ShotCandidate,
 )
 from jobs.luts import apply_lut, parse_cube
+from jobs.sources.base import SourceAdapter, SourceAsset
 
 log = get_logger(__name__)
 
@@ -114,16 +115,45 @@ def _run_ffmpeg(args: list[str]) -> None:
         raise RenderError(f"ffmpeg 退出码 {proc.returncode}: {tail}")
 
 
-def _render_image(src: Path, dst: Path, lut_bytes: bytes | None) -> None:
+def _render_image(payload: bytes, dst: Path, lut_bytes: bytes | None) -> None:
+    """照片导出：套 LUT 存 JPEG。吃字节 —— 照片可能不在本地（006 迁移，渲染时现下载）。"""
+    import io
+
     import numpy as np
     from PIL import Image, ImageOps
 
-    with Image.open(src) as im:
+    with Image.open(io.BytesIO(payload)) as im:
         oriented = ImageOps.exif_transpose(im) or im
         rgb = np.asarray(oriented.convert("RGB"), dtype=np.uint8)
     if lut_bytes is not None:
         rgb = apply_lut(rgb, parse_cube(lut_bytes))
     Image.fromarray(rgb, mode="RGB").save(dst, format="JPEG", quality=90)
+
+
+async def _load_image_bytes(asset: MediaAsset, adapter: SourceAdapter | None) -> bytes:
+    """取照片原图字节：本地文件优先；没有就按 source_url 从源站现下载。
+
+    照片不落盘是刻意的（省本地空间）—— 渲染是低频、单张、小文件，
+    现下载比常年占盘便宜得多。下载走 adapter，沿用其限速与重试纪律。
+    """
+    if asset.path:
+        local = Path(asset.path)
+        if await asyncio.to_thread(local.is_file):
+            return await asyncio.to_thread(local.read_bytes)
+    if asset.source_url.startswith("local://"):
+        raise RenderError(f"照片原图缺失且无法远程获取（{asset.source_url}）——文件被移动或删除了？")
+    if adapter is None:
+        raise RenderError("照片在远端但渲染器没有源站 adapter，无法下载原图")
+    source = SourceAsset(
+        album=asset.album,
+        filename=Path(asset.source_url).name,
+        photo_url=asset.source_url,
+        kind="image",
+    )
+    chunks: list[bytes] = []
+    async for chunk in adapter.open_asset(source):
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 @dataclass(slots=True)
@@ -172,7 +202,10 @@ async def _load_items(session: AsyncSession, project: EditProject) -> list[_Rend
 
 
 async def render_project(
-    session: AsyncSession, settings: Settings, project_id: uuid.UUID
+    session: AsyncSession,
+    settings: Settings,
+    project_id: uuid.UUID,
+    adapter: SourceAdapter | None = None,
 ) -> dict[str, object]:
     """渲染一个项目的全部锁定镜头。产出片段/照片 + manifest.csv + 打包 zip。"""
     project = await session.get(EditProject, project_id)
@@ -198,6 +231,8 @@ async def render_project(
         )
 
         if asset.kind == "video":
+            if not asset.path:
+                raise RenderError(f"镜头 {shot.idx} 的视频没有本地文件记录")
             precise_in = cand.in_ms if cand.in_ms is not None else scene.start_ms
             precise_out = cand.out_ms if cand.out_ms is not None else scene.end_ms
             padded_in = max(0, precise_in - settings.render_handle_ms)
@@ -229,7 +264,9 @@ async def render_project(
         else:
             precise_in = precise_out = padded_in = padded_out = 0
             dst = proj_dir / f"{shot.idx:02d}_{slugify(shot.description, 24)}.jpg"
-            await asyncio.to_thread(_render_image, Path(asset.path), dst, lut_bytes)
+            payload = await _load_image_bytes(asset, adapter)
+            await asyncio.to_thread(_render_image, payload, dst, lut_bytes)
+            del payload
             args = []
             kind = "image"
 
@@ -258,7 +295,8 @@ async def render_project(
                 "description": shot.description,
                 "file": dst.name,
                 "kind": kind,
-                "source_file": Path(asset.path).name,
+                # 远端照片没有本地文件，manifest 里记源站 URL 的文件名，后期同样能对回原片
+                "source_file": Path(asset.path).name if asset.path else Path(asset.source_url).name,
                 "album": asset.album,
                 "precise_in_ms": precise_in,
                 "precise_out_ms": precise_out,

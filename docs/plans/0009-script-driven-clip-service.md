@@ -3,7 +3,9 @@
 > **合入 main 时的适配说明**：main 已先行合并 plans/0006（邀请码入库，prefix.secret
 > 一码一相册）与 0008（视频人脸检索），因此本计划落地时做了两处对齐：
 > ① 不建 edit_invite 表，改为给既有 invite_code 表加 role 列（edit 码必绑相册，
-> 行 id 即 workspace_id）；② 迁移编号为 005、本文档编号为 0009。
+> 行 id 即 workspace_id）；② 迁移编号为 005、本文档编号为 0009；
+> ③ 上线后追加（006）：**照片不落盘** —— media/<album>/ 只放视频，照片分析走
+> 内存直通、渲染时按 source_url 现下载，本地盘占用 ≈ 视频总量。
 
 状态：**第一版已实施**（P1~P4 的主体 + 反馈闭环 + 断点恢复 + agent 框架，
 一次合入；未含 scene_face 人物过滤、in/out 微调 UI、FCPXML/EDL，见

@@ -16,7 +16,7 @@
 
    ```
    /photo-gallery/
-   ├── media/<album>/     原片，首次被引用时自动下载（或手动拷入后 --local-only 建库）
+   ├── media/<album>/     **只放视频原片**（照片不落盘：分析在内存完成、渲染时现下载）
    ├── output/<workspace>/ 渲染产物，按码隔离，render 自动创建
    ├── luts/              自备 .cube 滤镜模版放这里
    └── agent-prompts/     可选：提示词热覆盖（同名文件优先于仓库内置）
@@ -78,6 +78,22 @@ docker compose run --rm jobs python -m jobs filters-import --disable <slug>
 多个码可绑同一相册（素材共享，项目/成片互相不可见）。查找码照旧
 `invite create --album ...`（不带 --role）。
 
+## 照片不落盘（006 迁移起）
+
+建库只把**视频**下载到本地（拆条与 ffmpeg 剪裁必须随机访问文件）；照片的关键帧、
+画质指标、CLIP 向量都在下载字节的生命周期内算完即弃，评审预览用库里的关键帧，
+渲染导出那一刻才按 source_url 从源站现下载单张原图 —— 本地盘的占用 ≈ 视频总量。
+
+006 之前已经下载到 media/<album>/ 里的照片文件可以直接删掉腾空间
+（渲染会自动回退到远程下载），例如：
+
+```bash
+find /photo-gallery/media/<album> -maxdepth 1 -type f \
+  \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \) -delete
+```
+
+手动拷入的本地照片（local:// 来源）仍然支持，但别删它们的文件 —— 它们没有远程回退。
+
 ## 预热大相册
 
 视频多的相册第一次建库要下载 + 拆条，可能几十分钟。重要活动提前跑：
@@ -91,6 +107,7 @@ make media-ingest ALBUM=2026-08-10
 
 ## 排查
 
+- **渲染报「照片原图缺失」**：local:// 来源的本地照片文件被移动/删除了 —— 放回原位或重新建库。
 - **任务卡住/失败**：`job_run` 表是第一现场（queued/running/failed + error + stats）。
   worker 被杀掉时任务停在 running —— 重启 worker 后手动把该行改回 queued 即可重跑。
 - **候选全不对**：先确认 `scene` 表里该相册有数据、`edit_sim_floor` 没设太高；

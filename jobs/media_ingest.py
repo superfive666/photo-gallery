@@ -1,4 +1,8 @@
-"""剪辑素材建库：下载相册原片（首次）→ 拆条 → 关键帧 → CLIP 向量 + 画质指标 → 落库。
+"""剪辑素材建库：视频下载落盘 + 拆条；照片内存直通 —— 全部产出关键帧 + CLIP 向量 + 画质指标。
+
+**照片不落盘**（006 迁移）：分析所需的一切（关键帧缩略图、画质、向量）在下载字节的
+生命周期内完成，评审预览用库里的关键帧，渲染导出时按 source_url 现下载 ——
+本地盘只需要放视频（拆条与 ffmpeg 剪裁必须随机访问文件）。
 
 与 pipeline.py（人脸建库）是两条独立管线，但同一套纪律：
   · **幂等**：media_asset 以 source_url 唯一约束 upsert；重写 scene 前先按 asset 删旧。
@@ -39,11 +43,11 @@ from jobs.scenes import (
     VideoProbeError,
     detect_scenes,
     extract_keyframe,
-    image_keyframe,
+    image_keyframe_bytes,
     probe_video,
     sample_gray_frames,
 )
-from jobs.sources.base import SourceAdapter
+from jobs.sources.base import SourceAdapter, SourceAsset
 
 log = get_logger(__name__)
 
@@ -57,6 +61,7 @@ _FINGERPRINT_BYTES = 1024 * 1024
 @dataclass
 class MediaIngestStats:
     downloaded: int = 0
+    images_remote: int = 0
     processed: int = 0
     skipped_existing: int = 0
     failed: int = 0
@@ -66,6 +71,7 @@ class MediaIngestStats:
     def as_dict(self) -> dict[str, Any]:
         return {
             "downloaded": self.downloaded,
+            "images_remote": self.images_remote,
             "processed": self.processed,
             "skipped_existing": self.skipped_existing,
             "failed": self.failed,
@@ -97,15 +103,22 @@ def _safe_filename(url_or_name: str) -> str:
     return name.replace("/", "_").replace("\x00", "")[:200]
 
 
-async def _download_missing(
+async def _sync_remote_assets(
     adapter: SourceAdapter,
     album: str,
     media_dir: Path,
     stats: MediaIngestStats,
-) -> dict[str, str]:
-    """把源站相册里本地还没有的原片下载到 media/<album>/。返回 {文件名: source_url}。"""
+) -> tuple[dict[str, str], list[SourceAsset]]:
+    """视频下载到 media/<album>/（缺什么下什么）；照片不落盘，收集起来走内存直通。
+
+    返回 ({视频文件名: source_url}, 待处理的照片资产列表)。
+    """
     url_by_name: dict[str, str] = {}
+    remote_images: list[SourceAsset] = []
     async for asset in adapter.list_assets(album):
+        if asset.kind == "image":
+            remote_images.append(asset)
+            continue
         name = _safe_filename(asset.filename or asset.photo_url)
         url_by_name[name] = asset.photo_url
         target = media_dir / name
@@ -122,7 +135,7 @@ async def _download_missing(
         except Exception as exc:
             stats.errors.append(f"download {name}: {type(exc).__name__}")
             await asyncio.to_thread(tmp.unlink, True)
-    return url_by_name
+    return url_by_name, remote_images
 
 
 @dataclass(slots=True)
@@ -176,14 +189,17 @@ def _analyze_video(path: Path, min_seconds: float) -> tuple[Any, list[_SceneDraf
     return info, drafts
 
 
-def _analyze_image(path: Path) -> tuple[int, int, _SceneDraft]:
-    """照片：整张即一个 scene，稳定性恒为 1。返回 (原宽, 原高, draft)。"""
+def _analyze_image_bytes(data: bytes) -> tuple[int, int, _SceneDraft]:
+    """照片字节：整张即一个 scene，稳定性恒为 1。返回 (原宽, 原高, draft)。
+
+    只吃字节 —— 远端照片不落盘（006 迁移），本地预拷入的照片由调用方读出字节。
+    """
     import io
 
     import numpy as np
     from PIL import Image
 
-    payload, kw, kh, width, height = image_keyframe(path)
+    payload, kw, kh, width, height = image_keyframe_bytes(data)
     with Image.open(io.BytesIO(payload)) as img:
         gray = to_gray(np.asarray(img.convert("RGB"), dtype=np.uint8))
     return (
@@ -220,9 +236,16 @@ async def ingest_album_media(
     media_dir = Path(settings.media_dir(album))
     await asyncio.to_thread(media_dir.mkdir, parents=True, exist_ok=True)
 
+    existing_rows = (
+        (await session.execute(select(MediaAsset).where(MediaAsset.album == album))).scalars().all()
+    )
+    by_url = {row.source_url: row for row in existing_rows}
+
     url_by_name: dict[str, str] = {}
     if adapter is not None:
-        url_by_name = await _download_missing(adapter, album, media_dir, stats)
+        url_by_name, remote_images = await _sync_remote_assets(adapter, album, media_dir, stats)
+        for asset in remote_images:
+            await _ingest_remote_image(session, settings, clip, adapter, asset, by_url, stats)
 
     files = sorted(
         p
@@ -230,10 +253,7 @@ async def ingest_album_media(
         if p.is_file() and _kind_of(p) is not None
     )
 
-    existing_rows = (
-        (await session.execute(select(MediaAsset).where(MediaAsset.album == album))).scalars().all()
-    )
-    by_path = {row.path: row for row in existing_rows}
+    by_path = {row.path: row for row in existing_rows if row.path}
 
     for path in files:
         kind = _kind_of(path)
@@ -294,7 +314,9 @@ async def _process_asset(
         row.fps, row.codec = info.fps, info.codec
         tier = resolution_tier(info.height)
     else:
-        width, height, draft = await asyncio.to_thread(_analyze_image, path)
+        payload = await asyncio.to_thread(path.read_bytes)
+        width, height, draft = await asyncio.to_thread(_analyze_image_bytes, payload)
+        del payload
         drafts = [draft]
         row.width, row.height = width, height
         tier = resolution_tier(height)
@@ -303,7 +325,21 @@ async def _process_asset(
     row.size_bytes = (await asyncio.to_thread(path.stat)).st_size
     row.resolution_tier = tier
 
-    # 关键帧 → CLIP 向量（分块批量）。取不到关键帧的镜头没有可检索的内容，直接丢弃。
+    await _embed_and_write_scenes(session, settings, clip, row, tier, drafts, stats, path.name)
+    log.info("media_asset_embedded", file=path.name, kind=kind, scenes=row.scene_count)
+
+
+async def _embed_and_write_scenes(
+    session: AsyncSession,
+    settings: Settings,
+    clip: ClipClient,
+    row: MediaAsset,
+    tier: float,
+    drafts: list[_SceneDraft],
+    stats: MediaIngestStats,
+    label: str,
+) -> None:
+    """关键帧 → CLIP 向量（分块批量）→ scene 落库。取不到关键帧的镜头直接丢弃。"""
     usable = [d for d in drafts if d.keyframe is not None]
     embeddings: list[list[float]] = []
     model_name, model_version = "", ""
@@ -315,7 +351,7 @@ async def _process_asset(
         model_name, model_version = batch.model_name, batch.model_version
         for d, result in zip(chunk, batch.results, strict=True):
             if result.embedding is None:
-                stats.errors.append(f"{path.name}@{d.start_ms}: {result.error}")
+                stats.errors.append(f"{label}@{d.start_ms}: {result.error}")
                 embeddings.append([])
             else:
                 embeddings.append(result.embedding)
@@ -355,7 +391,59 @@ async def _process_asset(
     row.processing_error = None
     row.updated_at = dt.datetime.now(tz=dt.UTC)
     stats.scenes_added += added
-    log.info("media_asset_embedded", file=path.name, kind=kind, scenes=added)
+
+
+async def _ingest_remote_image(
+    session: AsyncSession,
+    settings: Settings,
+    clip: ClipClient,
+    adapter: SourceAdapter,
+    asset: SourceAsset,
+    by_url: dict[str, MediaAsset],
+    stats: MediaIngestStats,
+) -> None:
+    """远端照片的内存直通：下载字节 → 分析 → 向量化 → 丢弃，不写盘。
+
+    幂等：source_url 唯一，已 embedded 的直接跳过（源站照片 URL 稳定且内容不变，
+    与 photo 表的幂等假设一致）—— 重跑不重新下载。
+    """
+    row = by_url.get(asset.photo_url)
+    if row is not None and row.processing_status == "embedded":
+        stats.skipped_existing += 1
+        return
+
+    name = _safe_filename(asset.filename or asset.photo_url)
+    if row is None:
+        row = MediaAsset(album=asset.album, source_url=asset.photo_url, path=None, kind="image")
+        session.add(row)
+        await session.flush()
+        by_url[asset.photo_url] = row
+
+    try:
+        chunks: list[bytes] = []
+        async for chunk in adapter.open_asset(asset):
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+        del chunks
+
+        width, height, draft = await asyncio.to_thread(_analyze_image_bytes, payload)
+        row.width, row.height = width, height
+        row.size_bytes = len(payload)
+        row.checksum = hashlib.sha256(payload).hexdigest()
+        del payload
+        tier = resolution_tier(height)
+
+        await _embed_and_write_scenes(session, settings, clip, row, tier, [draft], stats, name)
+        stats.images_remote += 1
+        stats.processed += 1
+        log.info("media_asset_embedded", file=name, kind="image_remote", scenes=row.scene_count)
+    except Exception as exc:  # 网络/解码/推理任一失败都只废这一张，不中断整批
+        stats.failed += 1
+        stats.errors.append(f"{name}: {type(exc).__name__}")
+        row.processing_status = "failed"
+        row.processing_error = f"{type(exc).__name__}: {exc}"
+        log.warning("media_asset_failed", file=name, error_type=type(exc).__name__)
+    await session.commit()
 
 
 async def album_is_ingested(session: AsyncSession, album: str) -> bool:
