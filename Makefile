@@ -30,8 +30,8 @@ outdated: ## 列出可升级的依赖，不改动 uv.lock
 # 容器环境
 # ---------------------------------------------------------------------------
 .PHONY: up
-up: ## 起 embedding + api + web（本地 localdb 叠加层会顺带起容器化 pg）
-	$(COMPOSE) up -d embedding api web
+up: ## 起 embedding + api + web + worker（本地 localdb 叠加层会顺带起容器化 pg）
+	$(COMPOSE) up -d embedding api web worker
 
 .PHONY: down
 down: ## 停掉全部容器（保留数据卷）
@@ -92,6 +92,18 @@ block: ## opt-out：屏蔽某人全部人脸。用法：make block SELFIE=/data/
 .PHONY: eval
 eval: ## 跑评估集，输出 precision/recall 与漏检归因
 	$(COMPOSE) run --rm jobs python -m jobs eval $(if $(SWEEP),--sweep,)
+
+# ---------------------------------------------------------------------------
+# 剪辑域（docs/media-edit.md）
+# ---------------------------------------------------------------------------
+.PHONY: media-ingest
+media-ingest: ## 剪辑素材建库（手动预热）。用法：make media-ingest ALBUM=2026-08-10
+	@test -n "$(ALBUM)" || { echo "用法：make media-ingest ALBUM=<slug>"; exit 2; }
+	$(COMPOSE) run --rm jobs python -m jobs media-ingest --album $(ALBUM)
+
+.PHONY: filters-import
+filters-import: ## 导入滤镜库（内置预设 + /photo-gallery/luts 下的 .cube）
+	$(COMPOSE) run --rm jobs python -m jobs filters-import
 
 # ---------------------------------------------------------------------------
 # 质量

@@ -29,8 +29,17 @@ Postgres 16 + [pgvector](https://github.com/pgvector/pgvector) ≥ 0.8。
 | `block_list` | opt-out | 按 face 或 photo；检索在 SQL 层过滤 |
 | `invite_code` | 邀请码 ↔ 相册绑定 | `prefix` 唯一索引定位行 → 单次 argon2 验证；`album` NULL = 全相册；吊销置 `disabled_at` 不删行 |
 | `album_sync_state` | 同步进度 | 按 album slug |
-| `job_run` | 离线任务记录 | 排查召回率变差的第一现场 |
+| `job_run` | 离线任务记录 + 剪辑域任务队列 | 排查召回率变差的第一现场；005 起 status=queued 由 worker 认领 |
 | `search_audit` | 检索留痕 | **只有计数与耗时**，无图片无向量 |
+| `invite_code` | 邀请码 ↔ 相册 | 005 起分角色：search 查照片 / edit 剪辑（一码一相册，行 id 即 workspace_id） |
+| `media_asset` | 剪辑素材一行 | 原片落盘在 /photo-gallery/media/<album>/；source_url 唯一 → 幂等 |
+| `scene` | **剪辑域向量主表** | Chinese-CLIP 图像向量 + 画质列；HNSW cosine；与 face 不同向量空间 |
+| `filter_preset` | 滤镜库 | 一切滤镜都是 3D LUT；slug 唯一；软下架不删行 |
+| `edit_project` | 一次剪辑任务 | 状态机 + state_version 乐观锁；album 创建时固化 |
+| `edit_round` | 反馈闭环留痕 | 每轮用户输入 + shot list 快照 + llm/提示词指纹 |
+| `shot` / `shot_candidate` | 镜头与候选 | locked 后绝不重写；rejected 的 scene 后续轮次排除 |
+| `render_output` | 渲染产物 | 精确/含余量两组时码 + 滤镜 slug+checksum，可复现 |
+| `project_event` | 事件时间线（聊天窗数据源） | 只追加不改写；无向量无图片字节 |
 
 只有两张主表：
 

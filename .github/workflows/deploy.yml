@@ -86,7 +86,7 @@ jobs:
         id: restart
         run: |
           cd "$DEPLOY_DIR"
-          docker compose up -d --no-deps embedding api web
+          docker compose up -d --no-deps embedding api web worker
 
       - name: 健康检查
         id: health
@@ -161,7 +161,7 @@ jobs:
             exit 1
           fi
           echo "::warning::健康检查未通过，回滚到 $prev"
-          IMAGE_TAG="$prev" docker compose up -d --no-deps --force-recreate embedding api web
+          IMAGE_TAG="$prev" docker compose up -d --no-deps --force-recreate embedding api web worker
           # 无论回滚是否成功，这次部署都算失败
           exit 1
 

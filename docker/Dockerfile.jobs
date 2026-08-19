@@ -3,6 +3,13 @@ FROM python:3.11-slim
 
 COPY --from=ghcr.io/astral-sh/uv:0.8.17 /uv /uvx /bin/
 
+# 剪辑域：ffmpeg/ffprobe CLI 负责拆条探测与剪裁转码（PyAV 只带库不带 CLI）；
+# libglib2.0-0 是 opencv-headless 的运行依赖。常驻 worker 与一次性 jobs 共用本镜像。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     UV_COMPILE_BYTECODE=1 \

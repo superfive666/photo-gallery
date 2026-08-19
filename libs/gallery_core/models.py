@@ -13,6 +13,7 @@ from typing import Any
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
@@ -177,6 +178,8 @@ class JobRun(Base):
     finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
     stats: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     error: Mapped[str | None] = mapped_column(Text)
+    # 剪辑域队列任务的入参（如 project_id）。老 kind 不用它。见 005_media_edit.sql。
+    params: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
 
 
 class SearchAudit(Base):
@@ -220,8 +223,257 @@ class InviteCode(Base):
     prefix: Mapped[str] = mapped_column(String(16), unique=True)
     code_hash: Mapped[str] = mapped_column(Text)
     album: Mapped[str | None] = mapped_column(ALBUM_TYPE)
+    # 'search'（默认，查照片）| 'edit'（剪辑聊天窗）。edit 码必须绑定相册，
+    # 其行 id 即剪辑工作区 workspace_id。见 docs/schema/005_media_edit.sql。
+    role: Mapped[str] = mapped_column(Text, default="search")
     label: Mapped[str | None] = mapped_column(Text)
     disabled_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
+# 剪辑域（docs/schema/005_media_edit.sql，设计见 docs/plans/0005）。
+# 与照片检索域是两组表：media_asset 的原片落盘在 /photo-gallery/media/<album>/，
+# scene.embedding 是 Chinese-CLIP 的图像向量 —— 与 face 的人脸向量不同空间，绝不混用。
+# ---------------------------------------------------------------------------
+
+
+class MediaAsset(Base):
+    """剪辑素材一行。source_url 是幂等键（与 photo.photo_url 同思想）。"""
+
+    __tablename__ = "media_asset"
+
+    id: Mapped[uuid.UUID] = _uuid7_pk()
+    album: Mapped[str] = mapped_column(ALBUM_TYPE)
+    source_url: Mapped[str] = mapped_column(Text, unique=True)
+    path: Mapped[str] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(Text, default="image")
+
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    width: Mapped[int | None] = mapped_column(Integer)
+    height: Mapped[int | None] = mapped_column(Integer)
+    fps: Mapped[float | None] = mapped_column(REAL)
+    codec: Mapped[str | None] = mapped_column(Text)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    checksum: Mapped[str | None] = mapped_column(Text)
+    resolution_tier: Mapped[float] = mapped_column(REAL, default=0.0)
+
+    processing_status: Mapped[str] = mapped_column(Text, default="pending")
+    processing_error: Mapped[str | None] = mapped_column(Text)
+    scene_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    scenes: Mapped[list[Scene]] = relationship(back_populates="asset")
+
+
+class Scene(Base):
+    """剪辑检索的基本单元。视频一个镜头一行；照片整张即一个 scene。"""
+
+    __tablename__ = "scene"
+
+    id: Mapped[uuid.UUID] = _uuid7_pk()
+    asset_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("media_asset.id", ondelete="CASCADE"))
+    # 冗余自 media_asset：检索外层过滤直接用，免 join
+    album: Mapped[str] = mapped_column(ALBUM_TYPE)
+
+    start_ms: Mapped[int] = mapped_column(Integer, default=0)
+    end_ms: Mapped[int] = mapped_column(Integer, default=0)
+
+    keyframe: Mapped[bytes | None] = mapped_column(LargeBinary)
+    keyframe_width: Mapped[int | None] = mapped_column(Integer)
+    keyframe_height: Mapped[int | None] = mapped_column(Integer)
+
+    # Chinese-CLIP 图像塔输出，出口 L2 归一化（约束 4）
+    embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM))
+    model_name: Mapped[str] = mapped_column(Text)
+    model_version: Mapped[str] = mapped_column(Text)
+    dim: Mapped[int] = mapped_column(Integer, default=EMBEDDING_DIM)
+
+    # 画质列，0~1。照片没有稳定性概念，恒为 1。
+    stability: Mapped[float] = mapped_column(REAL, default=1.0)
+    sharpness: Mapped[float] = mapped_column(REAL, default=0.0)
+    exposure: Mapped[float] = mapped_column(REAL, default=0.0)
+    quality_score: Mapped[float] = mapped_column(REAL, default=0.0)
+    face_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    asset: Mapped[MediaAsset] = relationship(back_populates="scenes")
+
+
+class FilterPreset(Base):
+    """滤镜库。一切滤镜都是 3D LUT（内置预设在导入时由代码生成）。"""
+
+    __tablename__ = "filter_preset"
+
+    id: Mapped[uuid.UUID] = _uuid7_pk()
+    slug: Mapped[str] = mapped_column(String(100), unique=True)
+    display_name: Mapped[str] = mapped_column(Text)
+    lut: Mapped[bytes] = mapped_column(LargeBinary)
+    preview: Mapped[bytes | None] = mapped_column(LargeBinary)
+    checksum: Mapped[str] = mapped_column(Text)
+    builtin: Mapped[bool] = mapped_column(Boolean, default=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class EditProject(Base):
+    """一次剪辑任务（聊天窗里的一个会话）。用户提交剧本时隐式创建。"""
+
+    __tablename__ = "edit_project"
+
+    id: Mapped[uuid.UUID] = _uuid7_pk()
+    workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("invite_code.id"))
+    # 冗余自 invite_code，创建时固化 —— 之后改绑码也不影响存量项目
+    album: Mapped[str] = mapped_column(ALBUM_TYPE)
+    title: Mapped[str] = mapped_column(Text, default="")
+    script: Mapped[str] = mapped_column(Text)
+
+    status: Mapped[str] = mapped_column(Text, default="ingesting")
+    error: Mapped[str | None] = mapped_column(Text)
+    current_round: Mapped[int] = mapped_column(Integer, default=1)
+    # 乐观并发控制：双设备同时操作时，过期写返回 409
+    state_version: Mapped[int] = mapped_column(Integer, default=0)
+    default_filter_slug: Mapped[str | None] = mapped_column(String(100))
+
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    shots: Mapped[list[Shot]] = relationship(back_populates="project")
+
+
+class EditRound(Base):
+    """反馈闭环留痕。第 N+1 轮的 LLM 上下文按轮次全量组装自这张表。"""
+
+    __tablename__ = "edit_round"
+
+    id: Mapped[uuid.UUID] = _uuid7_pk()
+    project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("edit_project.id", ondelete="CASCADE"))
+    round_no: Mapped[int] = mapped_column(Integer)
+    user_note: Mapped[str | None] = mapped_column(Text)
+    # {shot_idx: 反馈原文}
+    shot_feedback: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    shot_list: Mapped[list[Any]] = mapped_column(JSONB, default=list)
+    llm_model: Mapped[str | None] = mapped_column(Text)
+    prompt_fingerprint: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class Shot(Base):
+    """镜头一行。locked 后后续轮次绝不重写（评审反馈闭环的硬约定）。"""
+
+    __tablename__ = "shot"
+
+    id: Mapped[uuid.UUID] = _uuid7_pk()
+    project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("edit_project.id", ondelete="CASCADE"))
+    idx: Mapped[int] = mapped_column(Integer)
+    source_text: Mapped[str] = mapped_column(Text, default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    queries: Mapped[list[Any]] = mapped_column(JSONB, default=list)
+    media_kind: Mapped[str] = mapped_column(Text, default="any")
+    min_ms: Mapped[int | None] = mapped_column(Integer)
+    max_ms: Mapped[int | None] = mapped_column(Integer)
+    filter_slug: Mapped[str | None] = mapped_column(String(100))
+
+    locked: Mapped[bool] = mapped_column(Boolean, default=False)
+    locked_candidate_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    feedback: Mapped[str | None] = mapped_column(Text)
+    round_no: Mapped[int] = mapped_column(Integer, default=1)
+
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    project: Mapped[EditProject] = relationship(back_populates="shots")
+    candidates: Mapped[list[ShotCandidate]] = relationship(back_populates="shot")
+
+
+class ShotCandidate(Base):
+    """镜头×scene 候选。rejected 的 scene 在该镜头后续轮次的检索里排除（负反馈）。"""
+
+    __tablename__ = "shot_candidate"
+
+    id: Mapped[uuid.UUID] = _uuid7_pk()
+    shot_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("shot.id", ondelete="CASCADE"))
+    scene_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("scene.id", ondelete="CASCADE"))
+    round_no: Mapped[int] = mapped_column(Integer, default=1)
+    rank: Mapped[int] = mapped_column(Integer, default=0)
+    similarity: Mapped[float] = mapped_column(REAL, default=0.0)
+    quality: Mapped[float] = mapped_column(REAL, default=0.0)
+    final_score: Mapped[float] = mapped_column(REAL, default=0.0)
+    status: Mapped[str] = mapped_column(Text, default="pending")
+    in_ms: Mapped[int | None] = mapped_column(Integer)
+    out_ms: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    shot: Mapped[Shot] = relationship(back_populates="candidates")
+
+
+class RenderOutput(Base):
+    """渲染产物。滤镜记 slug+checksum，可追溯可复现。"""
+
+    __tablename__ = "render_output"
+
+    id: Mapped[uuid.UUID] = _uuid7_pk()
+    project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("edit_project.id", ondelete="CASCADE"))
+    shot_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("shot.id", ondelete="CASCADE"))
+    path: Mapped[str] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(Text)
+    precise_in_ms: Mapped[int | None] = mapped_column(Integer)
+    precise_out_ms: Mapped[int | None] = mapped_column(Integer)
+    padded_in_ms: Mapped[int | None] = mapped_column(Integer)
+    padded_out_ms: Mapped[int | None] = mapped_column(Integer)
+    filter_slug: Mapped[str | None] = mapped_column(String(100))
+    filter_checksum: Mapped[str | None] = mapped_column(Text)
+    tier: Mapped[str] = mapped_column(Text, default="crf16")
+    ffmpeg_args: Mapped[str | None] = mapped_column(Text)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class ProjectEvent(Base):
+    """追加式事件时间线，聊天窗的数据源。
+
+    事件流是展示层，状态表才是事实层：只追加不改写，payload 只存小快照 + id 引用。
+    绝不允许出现 embedding 或任何图片字节（约束 2 延伸适用）。
+    """
+
+    __tablename__ = "project_event"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("edit_project.id", ondelete="CASCADE"))
+    seq: Mapped[int] = mapped_column(Integer)
+    actor: Mapped[str] = mapped_column(Text)  # 'user' | 'assistant' | 'system'
+    kind: Mapped[str] = mapped_column(Text)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

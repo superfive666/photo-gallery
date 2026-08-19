@@ -9,10 +9,13 @@ from sqlalchemy import select
 from api.app import captcha
 from api.app.auth import (
     CSRF_COOKIE,
+    ROLE_EDIT,
+    ROLE_SEARCH,
     SESSION_COOKIE,
     SessionInfo,
     hash_invite_code,
     issue_session,
+    require_edit_session,
     require_session,
     split_invite_code,
     verify_code_hash,
@@ -47,6 +50,8 @@ class LoginOut(BaseModel):
     ttl_hours: int
     # 本 session 绑定的相册；null = 全相册
     album: str | None
+    # search（查照片）| edit（剪辑聊天窗）。前端据此分流 UI。
+    role: str = ROLE_SEARCH
 
 
 @router.get("/captcha", response_model=CaptchaOut)
@@ -76,25 +81,30 @@ async def login(
     if not captcha.verify(body.captcha_token, body.captcha_answer, settings.jwt_secret):
         raise HTTPException(status_code=400, detail="验证码不正确或已过期，请重试")
 
-    album = await _resolve_invite(body.invite_code, db, settings)
+    album, role, workspace_id = await _resolve_invite(body.invite_code, db, settings)
 
     # 设备 id 绑进 JWT：检索限流用 JWT 里的值，脚本清 cookie 换不来新身份
-    issue_session(response, settings, album=album, device=device)
-    return LoginOut(ok=True, ttl_hours=settings.session_ttl_hours, album=album)
+    issue_session(
+        response, settings, album=album, device=device, role=role, workspace_id=workspace_id
+    )
+    return LoginOut(ok=True, ttl_hours=settings.session_ttl_hours, album=album, role=role)
 
 
-async def _resolve_invite(code: str, db: DbDep, settings: SettingsDep) -> str | None:
-    """验证邀请码，返回它绑定的相册（None = 全相册）。失败抛 401。
+async def _resolve_invite(
+    code: str, db: DbDep, settings: SettingsDep
+) -> tuple[str | None, str, str | None]:
+    """验证邀请码，返回 (相册, 角色, workspace_id)。失败抛 401。
 
-    两条路径（见 auth.py 模块 docstring）：
-      `<prefix>.<secret>` → invite_code 表，绑定单相册；
-      其他形态           → .env 的全局码，全相册。
+    三条路径：
+      `<prefix>.<secret>` 且 role='search' → 查找，绑定单相册；
+      `<prefix>.<secret>` 且 role='edit'   → 剪辑聊天窗，workspace_id = 行 id；
+      其他形态                             → .env 的全局码，全相册查找。
     """
     parts = split_invite_code(code)
     if parts is None:
         if not verify_invite_code(code, settings):
             raise HTTPException(status_code=401, detail="邀请码不正确")
-        return None
+        return None, ROLE_SEARCH, None
 
     prefix, secret = parts
     row = (
@@ -114,7 +124,12 @@ async def _resolve_invite(code: str, db: DbDep, settings: SettingsDep) -> str | 
     # argon2 要 ~100ms 的 CPU，丢线程池，别卡事件循环
     if not await asyncio.to_thread(verify_code_hash, row.code_hash, secret):
         raise HTTPException(status_code=401, detail="邀请码不正确")
-    return row.album
+    if row.role == ROLE_EDIT:
+        # 一码一相册是剪辑域的硬语义：发码时就该带 --album，缺了是运维配置错误
+        if not row.album:
+            raise HTTPException(status_code=500, detail="服务端鉴权配置错误，请联系管理员")
+        return row.album, ROLE_EDIT, str(row.id)
+    return row.album, ROLE_SEARCH, None
 
 
 @router.post("/logout")
@@ -126,9 +141,14 @@ async def logout(response: Response, _csrf: CsrfDep) -> dict[str, bool]:
 
 @router.get("/me")
 async def me(request: Request, settings: SettingsDep) -> dict[str, bool | str | None]:
-    """前端用它判断是否已登录 + 本 session 的相册边界。"""
+    """前端用它判断是否已登录、本 session 的相册边界、走哪套 UI（查找/剪辑）。"""
+    try:
+        edit = require_edit_session(request, settings)
+        return {"authenticated": True, "album": edit.album, "role": ROLE_EDIT}
+    except HTTPException:
+        pass
     try:
         info: SessionInfo = require_session(request, settings)
     except HTTPException:
         return {"authenticated": False, "album": None}
-    return {"authenticated": True, "album": info.album}
+    return {"authenticated": True, "album": info.album, "role": ROLE_SEARCH}

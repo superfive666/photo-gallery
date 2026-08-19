@@ -102,6 +102,39 @@ class Settings(BaseSettings):
     video_track_sim: float = 0.6
     video_track_iou: float = 0.3
 
+    # --- 剪辑域：磁盘布局（专用盘挂 /photo-gallery，见 docs/plans/0005）---
+    # media/<album>/ 全局共享素材；output/<workspace_id>/ 按码隔离；luts/ 滤镜导入目录
+    media_root: str = "/photo-gallery"
+
+    # --- 剪辑域：LLM（OpenAI-compatible，私有模型即插即用）---
+    # 三元组留空 = 未配置，剧本解析走无 LLM 的回退路径（按行/编号切分镜头）。
+    llm_base_url: str = ""
+    llm_api_key: str = ""
+    llm_model: str = ""
+    llm_timeout_seconds: float = 120.0
+    llm_max_retries: int = 1
+
+    # --- 剪辑域：CLIP 图文检索模型（部署在 embedding 服务里）---
+    clip_model_name: str = "chinese-clip-vit-b-16"
+    clip_model_version: str = "1"
+
+    # --- 剪辑域：融合检索与渲染 ---
+    # ⚠️ 与人脸阈值一样，以下默认值是经验值，待真实素材标定（P0）。
+    edit_sim_floor: float = 0.18
+    # 画质分的融合权重上限 ≤ 0.35：画质只在"已相关"的候选之间起排序作用
+    edit_quality_weight: float = 0.35
+    edit_min_stability: float = 0.0
+    edit_top_k: int = 5
+    edit_knn_candidates: int = 200
+    # 拆条：短于这个秒数的镜头合并（PySceneDetect min_scene_len）
+    scene_min_seconds: float = 1.0
+    # 导出片段前后各留的余量，给后期编排空间
+    render_handle_ms: int = 1000
+    render_crf: int = 16
+    render_preset: str = "medium"
+    # jobs worker 的轮询间隔
+    worker_poll_seconds: float = 2.0
+
     # --- 其他 ---
     log_level: str = "INFO"
     schema_dir: str = "docs/schema"
@@ -109,6 +142,20 @@ class Settings(BaseSettings):
     def model_tag(self) -> str:
         """写入 face.model_name / model_version 的组合标识，用于溯源与重算。"""
         return f"{self.model_name}:{self.model_version}"
+
+    # --- 剪辑域磁盘布局（见 docs/plans/0005「磁盘布局」）---
+
+    def media_dir(self, album: str) -> str:
+        """某相册的原片目录。落盘后全程只读，转码产物一律写去 output。"""
+        return f"{self.media_root}/media/{album}"
+
+    def output_dir(self, workspace_id: str) -> str:
+        """渲染产物目录，按工作区隔离 —— 成片是用户私有交付物。"""
+        return f"{self.media_root}/output/{workspace_id}"
+
+    def luts_dir(self) -> str:
+        """滤镜导入目录（filters-import 扫这里）。"""
+        return f"{self.media_root}/luts"
 
     def insecure_secrets(self) -> list[str]:
         """返回仍是占位值的密钥字段名。

@@ -15,6 +15,10 @@ dependencies = [
     "api",
     # 视频抽帧（自带 ffmpeg 二进制，无需 apt 装 ffmpeg），见 plans/0008
     "av>=18.1.0",
+    # 剪辑域（plans/0009）：内容感知拆条 + 帧提取/画质指标。
+    # 剪裁转码用的是 ffmpeg CLI（Dockerfile.jobs 里 apt 装），av 只带库不带 CLI。
+    "scenedetect>=0.6.4",
+    "opencv-python-headless>=4.10",
 ]
 
 [tool.uv]

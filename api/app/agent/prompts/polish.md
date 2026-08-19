@@ -1,0 +1,26 @@
+下面是用户的剪辑剧本。请把它拆成镜头清单并润色每个镜头的画面描述。
+
+可用的滤镜预设 slug（推荐默认滤镜时只能从中选择）：
+{{filters}}
+
+用户剧本：
+<<<
+{{script}}
+>>>
+
+输出 JSON，结构如下（字段名与类型必须完全一致）：
+{
+  "title": "整个项目的短标题（取自剧本主题，10 字以内）",
+  "default_filter_slug": "从可用滤镜里推荐一个整体风格，无明显倾向时用 null",
+  "shots": [
+    {
+      "idx": 1,
+      "source_text": "该镜头对应的剧本原文片段",
+      "description": "润色后的具象画面描述（一句话）",
+      "queries": ["检索 query 1", "检索 query 2"],
+      "media_kind": "any | image | video（剧本明确要照片/视频时才指定，否则 any）",
+      "min_seconds": null,
+      "max_seconds": null
+    }
+  ]
+}

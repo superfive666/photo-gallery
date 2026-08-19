@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
+from embedding.app.clip import ClipEncoder
 from embedding.app.model import ExtractOutcome, FaceExtractor
 from gallery_core.logging import configure_logging, get_logger
 
@@ -33,6 +34,13 @@ MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(40 * 1024 * 1024)))
 # 每张图解码后是 W×H×3 字节，32 张 4000×3000 的图就是 ~1.1GB。
 MAX_BATCH_IMAGES = int(os.getenv("MAX_BATCH_IMAGES", "32"))
 
+# CLIP 图文双塔（剪辑域）。模型文件缺失时优雅降级：/healthz 报 clip_loaded=false，
+# CLIP 端点返回 503，人脸功能不受影响。
+CLIP_MODEL_DIR = os.getenv("CLIP_MODEL_DIR", "/opt/clip")
+CLIP_MODEL_NAME = os.getenv("CLIP_MODEL_NAME", "chinese-clip-vit-b-16")
+CLIP_MODEL_VERSION = os.getenv("CLIP_MODEL_VERSION", "1")
+CLIP_MAX_TEXTS = int(os.getenv("CLIP_MAX_TEXTS", "64"))
+
 _extractor = FaceExtractor(
     model_name=MODEL_NAME,
     model_version=MODEL_VERSION,
@@ -41,6 +49,14 @@ _extractor = FaceExtractor(
     num_threads=ORT_NUM_THREADS,
     use_gpu=USE_GPU,
     rec_batch_size=REC_BATCH_SIZE,
+)
+
+_clip = ClipEncoder(
+    model_dir=CLIP_MODEL_DIR,
+    model_name=CLIP_MODEL_NAME,
+    model_version=CLIP_MODEL_VERSION,
+    num_threads=ORT_NUM_THREADS,
+    use_gpu=USE_GPU,
 )
 
 # 推理是同步的密集调用。同时在跑的推理请求数限制在线程数附近：
@@ -53,6 +69,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     configure_logging(os.getenv("LOG_LEVEL", "INFO"))
     # 阻塞加载放到线程里，避免拖住 event loop 的启动
     await asyncio.to_thread(_extractor.load)
+    await asyncio.to_thread(_clip.load)
     try:
         yield
     finally:
@@ -114,6 +131,9 @@ async def healthz() -> dict[str, object]:
         "gpu": USE_GPU,
         "batch_supported": _extractor.batch_supported,
         "max_batch_images": MAX_BATCH_IMAGES,
+        "clip_loaded": _clip.loaded,
+        "clip_model_name": CLIP_MODEL_NAME,
+        "clip_model_version": CLIP_MODEL_VERSION,
     }
 
 
@@ -231,4 +251,101 @@ async def extract_batch(images: list[UploadFile] = File(...)) -> BatchExtractOut
         latency_ms=latency_ms,
         faces_total=faces_total,
         batched=_extractor.batch_supported,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLIP 图文端点（剪辑域）。见 embedding/app/clip.py 的预处理约定。
+# ---------------------------------------------------------------------------
+
+
+class ClipTextIn(BaseModel):
+    texts: list[str]
+
+
+class ClipTextOut(BaseModel):
+    embeddings: list[list[float]]
+    model_name: str
+    model_version: str
+    dim: int
+    latency_ms: int
+
+    model_config = {"protected_namespaces": ()}
+
+
+class ClipImageResult(BaseModel):
+    embedding: list[float] | None = None
+    # 非 None 表示这一张失败（解码错误），不影响同批其他图片
+    error: str | None = None
+
+
+class ClipImageBatchOut(BaseModel):
+    results: list[ClipImageResult]
+    model_name: str
+    model_version: str
+    dim: int
+    latency_ms: int
+
+    model_config = {"protected_namespaces": ()}
+
+
+@app.post("/clip/text", response_model=ClipTextOut)
+async def clip_text(body: ClipTextIn) -> ClipTextOut:
+    """文本批量向量化。在线检索的 query 走这里。"""
+    if not _clip.loaded:
+        raise HTTPException(status_code=503, detail="CLIP 模型未加载（模型文件缺失？）")
+    if not body.texts:
+        raise HTTPException(status_code=400, detail="texts 不能为空")
+    if len(body.texts) > CLIP_MAX_TEXTS:
+        raise HTTPException(status_code=413, detail=f"单次最多 {CLIP_MAX_TEXTS} 条文本")
+
+    started = time.perf_counter()
+    async with _inference_slots:
+        embeddings = await asyncio.to_thread(_clip.encode_texts, body.texts)
+    latency_ms = int((time.perf_counter() - started) * 1000)
+
+    # 只记计数与耗时，绝不记文本内容或向量
+    log.info("clip_text_done", texts=len(body.texts), latency_ms=latency_ms)
+    return ClipTextOut(
+        embeddings=embeddings,
+        model_name=CLIP_MODEL_NAME,
+        model_version=CLIP_MODEL_VERSION,
+        dim=len(embeddings[0]) if embeddings else 0,
+        latency_ms=latency_ms,
+    )
+
+
+@app.post("/clip/image/batch", response_model=ClipImageBatchOut)
+async def clip_image_batch(images: list[UploadFile] = File(...)) -> ClipImageBatchOut:  # noqa: B008
+    """图片批量向量化。离线建库的关键帧走这里，返回值与入参一一对应。"""
+    if not _clip.loaded:
+        raise HTTPException(status_code=503, detail="CLIP 模型未加载（模型文件缺失？）")
+    if not images:
+        raise HTTPException(status_code=400, detail="没有收到图片")
+    if len(images) > MAX_BATCH_IMAGES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"单次批量最多 {MAX_BATCH_IMAGES} 张，收到 {len(images)} 张",
+        )
+
+    payloads = [await _read_upload(image) for image in images]
+
+    started = time.perf_counter()
+    async with _inference_slots:
+        outcomes = await asyncio.to_thread(_clip.encode_images, payloads)
+    latency_ms = int((time.perf_counter() - started) * 1000)
+
+    dim = next((len(o.embedding) for o in outcomes if o.embedding), 0)
+    log.info(
+        "clip_image_batch_done",
+        images=len(outcomes),
+        failed=sum(1 for o in outcomes if o.error),
+        latency_ms=latency_ms,
+    )
+    return ClipImageBatchOut(
+        results=[ClipImageResult(embedding=o.embedding, error=o.error) for o in outcomes],
+        model_name=CLIP_MODEL_NAME,
+        model_version=CLIP_MODEL_VERSION,
+        dim=dim,
+        latency_ms=latency_ms,
     )
