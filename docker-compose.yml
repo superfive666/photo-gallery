@@ -72,9 +72,12 @@ services:
     env_file: .env
     volumes:
       # 剪辑域：只读挂 output 分发成片 zip；agent-prompts 提示词热覆盖（可选）。
-      # api 不挂 media —— 原片只有 jobs/worker 需要碰。
       - ${MEDIA_ROOT_HOST:-./photo-gallery-data}/output:/photo-gallery/output:ro
       - ${MEDIA_ROOT_HOST:-./photo-gallery-data}/agent-prompts:/photo-gallery/agent-prompts:ro
+      # 本地相册（plans/0010）：media/<album>/ 也是本地相册的素材目录，
+      # api 要从这里分发本地相册的原图（远端相册仍 302 到源站）。
+      # 只读挂载；写入 media 的只有 jobs/worker。
+      - ${MEDIA_ROOT_HOST:-./photo-gallery-data}/media:/photo-gallery/media:ro
     # 数据库在宿主机上，容器里用 host.docker.internal 访问它。
     # host-gateway 由 docker 解析成宿主机在 docker0 网桥上的地址 ——
     # 前提是宿主机 pg 的 listen_addresses 和 pg_hba 放行了 docker 网段，
@@ -128,8 +131,10 @@ services:
       # local_dir adapter 与评估集的输入目录
       - ${SOURCE_LOCAL_DIR:-./sample-albums}:/data/sample-albums:ro
       - ${EVAL_DIR:-./eval}:/data/eval:ro
-      # 剪辑域专用盘：media/<album> 原片、output/<workspace> 成片、luts 滤镜导入目录。
-      # 人脸建库的原图依旧不落盘 —— 这个卷只属于剪辑域。
+      # 专用盘：media/<album> 剪辑原片 + 本地相册素材（plans/0010）、
+      # output/<workspace> 成片、luts 滤镜导入目录。
+      # 远端相册的人脸建库原图依旧不落盘 —— 落在 media 里的只有剪辑视频副本
+      # 与运维放入的本地相册。
       - ${MEDIA_ROOT_HOST:-./photo-gallery-data}:/photo-gallery
       # 原图不落盘：批量推理把字节留在内存里，处理完即释放。所以这里没有原图缓存卷。
 

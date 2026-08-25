@@ -142,6 +142,9 @@ EMBEDDING_USE_GPU=true
   session 与 IP 两层限流。见 `docs/plans/0007`。
 - **登录验证码挡的是脚本批量试码，不是专业打码平台。** 自研 SVG captcha 的威胁模型
   就到这里 —— 更强的对抗手段（第三方 captcha）与本项目的 CSP 和隐私立场冲突，不做。
+- **本地相册的 HEIC/HEIF 原图在浏览器里表现为下载而非预览**（缩略图不受影响，是
+  WebP）。转码另立计划。本地相册的用法与来源判定规则见
+  [`docs/data-source.md`](docs/data-source.md)「本地相册」。
 
 ---
 

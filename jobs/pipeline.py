@@ -145,9 +145,22 @@ async def _ingest_album(
 ) -> None:
     started_at = dt.datetime.now(tz=dt.UTC)
 
+    # auto 模式（CompositeAdapter）：先按 plans/0010 的路由规则判定相册来源，
+    # 再用对应的子 adapter 列资产。不能直接用 composite 的目录兜底路由 ——
+    # 远端相册跑过剪辑建库后 media/<album>/ 里有视频副本，会被误判成本地相册。
+    # 取字节仍走传入的 adapter（按 URL scheme 分发，混存安全）。
+    lister = adapter
+    selector = getattr(adapter, "for_source", None)
+    if selector is not None:
+        from jobs.sources import resolve_album_source
+
+        source = await resolve_album_source(session, album, settings)
+        lister = selector(source)
+        log.info("album_source_resolved", album=album, source=source)
+
     # 静态相册页一次就给出全部条目，所以我们总是掌握完整清单，
     # 「没见到」即等于「源站已删除」。
-    assets = [a async for a in adapter.list_assets(album)]
+    assets = [a async for a in lister.list_assets(album)]
     seen_urls = {a.photo_url for a in assets}
 
     images: list[SourceAsset] = []

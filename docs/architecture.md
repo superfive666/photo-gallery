@@ -83,7 +83,8 @@
   响应里带 `selfie_discarded: true` 供前端向用户确认。
 - `GET /api/albums` — 有可检索人脸的相册列表，供前端筛选器使用。
 - `GET /api/photos/{id}/thumb` — 输出缩略图，带 ETag 与长缓存。
-- `GET /api/photos/{id}/original` — 302 到源站原图。
+- `GET /api/photos/{id}/original` — 远端相册 302 到源站原图；本地相册
+  （plans/0010，素材在 `{MEDIA_ROOT}/media/<album>/`）从只读挂载直接流式分发。
 - 不加载任何模型，镜像轻量，可自由扩容。
 
 ### `jobs` — 离线建库
@@ -230,7 +231,9 @@ extra 里，所以 embedding 镜像里没有 sqlalchemy / asyncpg / pgvector。
 源站是公开的，所以这里的安全边界和一般图库项目不同：
 
 **不需要的**：原图签名链接。签名保护的是源站访问控制，而源站没有访问控制可绕过。
-`/original` 直接 302 到 `photo_url`；保留这一跳只是为了不把源站 URL 结构写进前端。
+`/original` 对远端相册直接 302 到 `photo_url`；保留这一跳只是为了不把源站 URL 结构
+写进前端。本地相册（plans/0010）没有可 302 的地址，由 api 从只读挂载分发 ——
+相册越权仍统一 404，路径解析带越界防御（`gallery_core/local_source.py`）。
 
 **仍然需要的**：
 

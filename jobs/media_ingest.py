@@ -48,6 +48,7 @@ from jobs.scenes import (
     probe_video,
     sample_gray_frames,
 )
+from jobs.sources import resolve_album_source
 from jobs.sources.base import SourceAdapter, SourceAsset
 
 log = get_logger(__name__)
@@ -268,6 +269,18 @@ async def ingest_album_media(
         raise ClipServiceError(
             "embedding 服务的 CLIP 双塔未加载（CLIP_MODEL_DIR 配好了吗？），中止建库。"
         )
+
+    # auto 模式（CompositeAdapter）：相册来源按 plans/0010 规则判定。
+    # 本地相册不走远端列举 —— 素材本来就在 media/<album>/，直接走下面的本地
+    # 文件扫描；若还经 adapter 列一遍，同一张照片会以 local://album/... 与
+    # local://<album>/... 两种幂等键重复入库。远端相册则拿远端子 adapter，
+    # 避免 composite 的目录兜底路由被视频副本目录带偏。
+    selector = getattr(adapter, "for_source", None)
+    if selector is not None:
+        async with session_scope() as session:
+            source = await resolve_album_source(session, album, settings)
+        log.info("album_source_resolved", album=album, source=source)
+        adapter = None if source == "local" else selector("remote")
 
     media_dir = Path(settings.media_dir(album))
     await asyncio.to_thread(media_dir.mkdir, parents=True, exist_ok=True)

@@ -75,9 +75,13 @@ class Settings(BaseSettings):
     # 登录 captcha 的有效期（秒）。签发后超时未用即作废。
     captcha_ttl_seconds: int = 300
 
-    # --- 源站 photos.zrc.sg（公开、无需鉴权）---
-    source_adapter: Literal["local_dir", "static_gallery"] = "static_gallery"
+    # --- 素材来源 ---
+    # auto（默认）= 相册粒度路由：{media_root}/media/<album> 目录存在的相册走本地，
+    # 其余走 photos.zrc.sg；已入库相册沿用库里记录的 scheme。见 plans/0010。
+    # local_dir / static_gallery 保留为强制单源模式（开发、评估集用）。
+    source_adapter: Literal["auto", "local_dir", "static_gallery"] = "auto"
     source_base_url: str = "https://photos.zrc.sg"
+    # 仅 local_dir 单源模式使用；auto 模式的本地根固定是 local_albums_root()
     source_local_dir: str = "/data/sample-albums"
     # 抓取纪律：默认保守，别把自己家的图库打挂
     source_concurrency: int = 4
@@ -148,6 +152,11 @@ class Settings(BaseSettings):
     def media_dir(self, album: str) -> str:
         """某相册的原片目录。落盘后全程只读，转码产物一律写去 output。"""
         return f"{self.media_root}/media/{album}"
+
+    def local_albums_root(self) -> str:
+        """本地相册的根目录（auto 模式）。与剪辑域原片目录合一是刻意的：
+        本地素材天然落在拆条/渲染需要的位置上，剪辑建库不用再搬运。见 plans/0010。"""
+        return f"{self.media_root}/media"
 
     def output_dir(self, workspace_id: str) -> str:
         """渲染产物目录，按工作区隔离 —— 成片是用户私有交付物。"""

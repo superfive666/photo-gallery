@@ -88,7 +88,37 @@ class SourceAsset:
 | 实现 | 状态 |
 | --- | --- |
 | `static_gallery.py` | **可用，解析已按真实页面结构收敛**（`[data-lightbox]` 契约） |
-| `local_dir.py` | 可用。扫描本地目录（一级子目录名 = album slug），用于开发和评估集 |
+| `local_dir.py` | 可用。扫描本地目录（一级子目录名 = album slug）。两个用途：开发/评估集（`SOURCE_ADAPTER=local_dir`），以及本地相册（auto 模式，根目录 = `{MEDIA_ROOT}/media`） |
+| `composite.py` | **可用，`SOURCE_ADAPTER=auto` 的默认实现**。相册粒度路由本地/远端，取字节按 URL scheme 分发 |
+
+## 本地相册（plans/0010）
+
+不是所有素材都发布在 photos.zrc.sg —— 相册可以直接来自宿主机的本地目录。
+
+**运维动作只有一个**：把照片/视频放进 `${MEDIA_ROOT}/media/<slug>/`（与剪辑域
+原片目录合一），然后 `make ingest ALBUM=<slug>`。邀请码照旧
+`jobs invite create --album <slug>`，持码人不感知素材在哪 —— 检索、浏览、
+原图、剪辑与远端相册体验一致（本地原图由 api 从只读挂载分发，而不是 302）。
+
+**来源判定规则**（`jobs/sources/resolve_album_source`，按优先级）：
+
+1. 库里已有该相册的记录 → **记录的 scheme 说了算**（`photo.photo_url` 与
+   `media_asset.source_url` 都算证据）。远端相册跑过剪辑建库后
+   `media/<album>/` 里会有下载的视频副本 —— 只看目录会把它误判成本地相册，
+   这条规则挡住这个陷阱。
+2. 首次入库：`media/<album>/` 目录存在 → 本地，否则远端。
+3. `photo` 表同时出现两种 scheme（数据已分叉）→ 按远端处理并打 warning，
+   绝不静默改道。
+
+**边界与注意**：
+
+- 目录里的文件会被人脸建库（含子目录，`rglob`）；剪辑建库只扫一级文件，
+  本地相册的剪辑素材建议平铺。
+- 往**远端相册**的 media 目录手动拷文件：会被剪辑建库收编（既有行为，
+  合成键 `local://<album>/<file>`），但**不会**进人脸检索库（规则 1 判它远端）。
+- 本地相册的 photo_url 形态是 `local://album/<slug>/<相对路径>`，
+  URL↔路径换算的单一定义点在 `gallery_core/local_source.py`。
+- HEIC/HEIF 能入库检索，但浏览器打开原图表现为下载（已知局限）。
 
 ## 抓取纪律
 

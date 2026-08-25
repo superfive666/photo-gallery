@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import uuid
 
 from fastapi import APIRouter, HTTPException, Query, Response
-from fastapi.responses import RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.app.auth import SessionInfo
-from api.app.deps import DbDep, SessionDep
+from api.app.deps import DbDep, SessionDep, SettingsDep
+from gallery_core.local_source import is_local_url, resolve_local_path
 from gallery_core.models import Face, Photo
 
 router = APIRouter(prefix="/photos", tags=["photos"])
@@ -184,15 +186,31 @@ async def thumbnail(photo_id: uuid.UUID, db: DbDep, session: SessionDep) -> Resp
 
 
 @router.get("/{photo_id}/original")
-async def original(photo_id: uuid.UUID, db: DbDep, session: SessionDep) -> RedirectResponse:
-    """302 到源站原图。
+async def original(
+    photo_id: uuid.UUID, db: DbDep, session: SessionDep, settings: SettingsDep
+) -> Response:
+    """原图分发：远端相册 302 到源站，本地相册由这里直接流式分发。
 
-    photos.zrc.sg 是公开、无需鉴权的照片墙，所以这里不需要签名链接 ——
-    签名保护的是源站的访问控制，而源站本来就没有访问控制可绕过。
-    这一跳仍然保留，用途是：不把源站 URL 结构写进前端，以后源站改版只改这里。
+    远端（photos.zrc.sg 公开、无需鉴权）不需要签名链接 —— 签名保护的是源站的
+    访问控制，而源站本来就没有访问控制可绕过。保留这一跳是为了不把源站 URL
+    结构写进前端，源站改版只改这里。
+
+    本地相册（plans/0010）没有可 302 的地址，从只读挂载的 media 目录分发文件。
+    相册越权已由 _load_photo 统一挡下；路径解析（含越界防御）失败与文件缺失
+    统一 404，不向持码人区分原因。
     """
     photo = await _load_photo(db, photo_id, session)
-    return RedirectResponse(url=photo.photo_url, status_code=302)
+    if not is_local_url(photo.photo_url):
+        return RedirectResponse(url=photo.photo_url, status_code=302)
+
+    path = resolve_local_path(settings.local_albums_root(), photo.photo_url)
+    if path is None or not await asyncio.to_thread(path.is_file):
+        raise HTTPException(status_code=404, detail="原图不存在")
+    return FileResponse(
+        path,
+        filename=path.name,
+        headers={"Cache-Control": "private, max-age=604800"},
+    )
 
 
 def _sniff_image_type(data: bytes) -> str:
