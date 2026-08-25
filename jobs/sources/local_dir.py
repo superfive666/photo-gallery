@@ -1,7 +1,9 @@
 """本地目录 adapter。
 
-用途：开发与评估集。用本地样例照片把「离线建库 → 聚类 → 检索」整条链路跑通，
-不依赖源站可用性。
+两个用途：
+  · 开发与评估集（`SOURCE_ADAPTER=local_dir` 单源模式，根目录 = SOURCE_LOCAL_DIR）；
+  · 本地相册（auto 模式经 CompositeAdapter 路由，根目录 = {media_root}/media，
+    与剪辑域原片目录合一，见 plans/0010）。
 
 目录约定（一级子目录名 = album slug）：
 
@@ -17,29 +19,24 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+# URL↔路径换算收敛在 gallery_core（api 的本地原图分发也要用，且 api 不 import jobs）
+from gallery_core.local_source import photo_url_for, resolve_local_path
 from jobs.sources.base import SourceAsset
+
+__all__ = ["LocalDirAdapter", "photo_url_for"]
 
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 _VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".avi", ".webm"}
 _CHUNK = 256 * 1024
 
-# 与真站保持同样的 URL 形态，这样 photo_url 在两种 adapter 之间语义一致
-_LOCAL_SCHEME = "local://album"
-
-
-def photo_url_for(relative_path: str) -> str:
-    """相对根目录的路径（形如 `2026-08-10/IMG_0001.jpg`）→ photo_url。
-
-    评估集要把 labels.csv 里的相对路径对上库里的行，靠的就是这个函数。
-    URL 规则只在这里定义一次 —— 两处各写一遍的话，评估会把每张照片都判成
-    not_ingested，指标全为 0，而且看起来像「检索坏了」，极容易误诊。
-    """
-    return f"{_LOCAL_SCHEME}/{relative_path.lstrip('/')}"
-
 
 class LocalDirAdapter:
     def __init__(self, root: str | Path) -> None:
         self._root = Path(root)
+
+    @property
+    def root(self) -> Path:
+        return self._root
 
     async def list_albums(self) -> list[str]:
         if not self._root.is_dir():
@@ -83,5 +80,9 @@ class LocalDirAdapter:
         return None
 
     def _path_of(self, asset: SourceAsset) -> Path:
-        relative = asset.photo_url.removeprefix(f"{_LOCAL_SCHEME}/")
-        return self._root / relative
+        path = resolve_local_path(self._root, asset.photo_url)
+        if path is None:
+            # 不是 local://album/ 形态，或解析后越出根目录 —— 都不该发生在
+            # 建库流程产出的 URL 上，遇到即说明喂错了 adapter 或数据被篡改
+            raise ValueError(f"不是本地相册素材的合法 photo_url: {asset.photo_url}")
+        return path

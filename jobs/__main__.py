@@ -19,7 +19,10 @@ import json
 import sys
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 from gallery_core.config import get_settings
 from gallery_core.db import get_engine, session_scope
@@ -45,8 +48,11 @@ async def cmd_probe(args: argparse.Namespace) -> int:
     photos.zrc.sg 的相册页标记结构尚未确认，`static_gallery.py` 里是通用解析。
     用这个命令确认解析结果是否正确，再把解析收敛成精确的选择器。
     """
+    from jobs.sources import CompositeAdapter
+
     adapter = build_adapter()
     report: dict[str, Any] = {"adapter": get_settings().source_adapter}
+    is_auto = isinstance(adapter, CompositeAdapter)
 
     try:
         albums = await adapter.list_albums()
@@ -63,6 +69,11 @@ async def cmd_probe(args: argparse.Namespace) -> int:
         return 1
 
     report["probed_album"] = target
+    if is_auto:
+        # 无 DB 的目录兜底判定（路由规则 2）—— probe 是诊断命令，不连库；
+        # 建库时的最终判定还会叠加「库里记录的 scheme 优先」（规则 1）。
+        assert isinstance(adapter, CompositeAdapter)
+        report["album_source"] = "local" if adapter.album_dir_exists(target) else "remote"
     try:
         assets = [a async for a in adapter.list_assets(target)]
     except Exception as exc:
@@ -278,6 +289,26 @@ async def cmd_block(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _album_known(session: AsyncSession, album: str) -> bool:
+    """发码时的拼写核对：相册是本地目录，或库里已有它的照片/剪辑素材。"""
+    from sqlalchemy import text as sql_text
+
+    known = (
+        await session.execute(
+            sql_text(
+                "SELECT EXISTS (SELECT 1 FROM photo WHERE album = :album)"
+                "    OR EXISTS (SELECT 1 FROM media_asset WHERE album = :album)"
+            ),
+            {"album": album},
+        )
+    ).scalar()
+    if bool(known):
+        return True
+    if "/" in album or "\\" in album:
+        return False
+    return await asyncio.to_thread((Path(get_settings().local_albums_root()) / album).is_dir)
+
+
 async def cmd_invite(args: argparse.Namespace) -> int:
     """邀请码运维：发码 / 列码 / 吊销。
 
@@ -295,6 +326,7 @@ async def cmd_invite(args: argparse.Namespace) -> int:
             print("剪辑码必须绑定相册：--role edit 时 --album 必填", file=sys.stderr)
             return 2
         full_code, prefix, code_hash = generate_invite_code()
+        album_known = True
         async with session_scope() as session:
             invite = InviteCode(
                 prefix=prefix,
@@ -306,6 +338,8 @@ async def cmd_invite(args: argparse.Namespace) -> int:
             session.add(invite)
             await session.flush()
             workspace_id = str(invite.id)
+            if args.album:
+                album_known = await _album_known(session, args.album)
         print(
             json.dumps(
                 {
@@ -327,6 +361,15 @@ async def cmd_invite(args: argparse.Namespace) -> int:
         )
         if args.album is None:
             print("⚠️ 未指定 --album：这是一张全相册的管理码。", file=sys.stderr)
+        elif not album_known:
+            # 只提醒不阻断 —— 「先发码后建库」是允许的顺序，但 slug 打错字
+            # 发出去的码会永远搜不到东西，这里是最后一道人工核对的机会。
+            print(
+                f"⚠️ 相册 {args.album} 既不是本地目录"
+                f"（{get_settings().local_albums_root()}/ 下没有），库里也没有它的记录。"
+                "请核对 slug 拼写；若是先发码后建库则可忽略。",
+                file=sys.stderr,
+            )
         return 0
 
     if args.invite_command == "list":

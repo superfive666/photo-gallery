@@ -26,9 +26,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.app.services.search import search_by_embedding
 from gallery_core.config import Settings
 from gallery_core.embedding_client import EmbeddingClient
+from gallery_core.local_source import photo_url_for
 from gallery_core.logging import get_logger
 from gallery_core.vector import mean_embedding
-from jobs.sources.local_dir import photo_url_for
 
 log = get_logger(__name__)
 
