@@ -63,8 +63,12 @@ _SCENE_SEARCH_SQL = text(
       AND s.stability >= :min_stability
       AND (:kind = 'any' OR ma.kind = :kind)
       AND NOT (s.id = ANY(CAST(:excluded AS uuid[])))
-      AND (:min_ms IS NULL OR ma.kind = 'image' OR (s.end_ms - s.start_ms) >= :min_ms)
-      AND (:max_ms IS NULL OR ma.kind = 'image' OR (s.end_ms - s.start_ms) <= :max_ms)
+      -- CAST 不能省：asyncpg 走预处理语句，纯 `:min_ms IS NULL OR ...` 推断不出
+      -- 参数类型，prepare 阶段就抛 AmbiguousParameterError（同 search.py 的 album）
+      AND (CAST(:min_ms AS integer) IS NULL OR ma.kind = 'image'
+           OR (s.end_ms - s.start_ms) >= CAST(:min_ms AS integer))
+      AND (CAST(:max_ms AS integer) IS NULL OR ma.kind = 'image'
+           OR (s.end_ms - s.start_ms) <= CAST(:max_ms AS integer))
     ORDER BY final_score DESC
     LIMIT :limit
     """
