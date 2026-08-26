@@ -456,19 +456,9 @@ async def _get_shot(session: AsyncSession, project: EditProject, shot_id: uuid.U
     return shot
 
 
-async def approve_shot(
-    session: AsyncSession,
-    project: EditProject,
-    shot_id: uuid.UUID,
-    candidate_id: uuid.UUID,
-    filter_slug: str | None,
-    in_ms: int | None,
-    out_ms: int | None,
-) -> None:
-    """满意：从候选中选定一条并锁定该镜头。"""
-    if project.status != "reviewing":
-        raise FlowError(f"当前状态 {project.status} 不能评审", http_status=409)
-    shot = await _get_shot(session, project, shot_id)
+async def _get_candidate(
+    session: AsyncSession, shot: Shot, candidate_id: uuid.UUID, label: str
+) -> ShotCandidate:
     candidate = (
         await session.execute(
             select(ShotCandidate).where(
@@ -477,9 +467,33 @@ async def approve_shot(
         )
     ).scalar_one_or_none()
     if candidate is None:
-        raise FlowError("候选不存在", http_status=404)
+        raise FlowError(f"{label}不存在", http_status=404)
     if candidate.status == "rejected":
-        raise FlowError("该候选已被否决过，不能再选定", http_status=409)
+        raise FlowError(f"该{label}已被否决过，不能再选定", http_status=409)
+    return candidate
+
+
+async def approve_shot(
+    session: AsyncSession,
+    project: EditProject,
+    shot_id: uuid.UUID,
+    candidate_id: uuid.UUID,
+    filter_slug: str | None,
+    in_ms: int | None,
+    out_ms: int | None,
+    backup_candidate_id: uuid.UUID | None = None,
+) -> None:
+    """满意：从候选中选定一条（可再带一条备选）并锁定该镜头。"""
+    if project.status != "reviewing":
+        raise FlowError(f"当前状态 {project.status} 不能评审", http_status=409)
+    shot = await _get_shot(session, project, shot_id)
+    candidate = await _get_candidate(session, shot, candidate_id, "候选")
+
+    backup: ShotCandidate | None = None
+    if backup_candidate_id is not None:
+        if backup_candidate_id == candidate_id:
+            raise FlowError("备选不能与主选是同一条")
+        backup = await _get_candidate(session, shot, backup_candidate_id, "备选候选")
 
     if in_ms is not None or out_ms is not None:
         if in_ms is not None and out_ms is not None and out_ms <= in_ms:
@@ -487,9 +501,25 @@ async def approve_shot(
         candidate.in_ms = in_ms
         candidate.out_ms = out_ms
 
+    # 重复 approve（换主意重锁）时先把上次的选中状态复位，
+    # 否则被放弃的旧选中会以 approved 状态躲过 regenerate 的负反馈标记
+    picked_ids = [candidate.id] + ([backup.id] if backup is not None else [])
+    await session.execute(
+        update(ShotCandidate)
+        .where(
+            ShotCandidate.shot_id == shot.id,
+            ShotCandidate.status == "approved",
+            ShotCandidate.id.not_in(picked_ids),
+        )
+        .values(status="pending")
+    )
+
     candidate.status = "approved"
+    if backup is not None:
+        backup.status = "approved"
     shot.locked = True
     shot.locked_candidate_id = candidate.id
+    shot.backup_candidate_id = backup.id if backup is not None else None
     shot.feedback = None
     if filter_slug is not None:
         shot.filter_slug = filter_slug
@@ -499,7 +529,21 @@ async def approve_shot(
         project,
         "user",
         "shot_locked",
-        {"idx": shot.idx, "candidate_id": str(candidate.id), "filter": shot.filter_slug},
+        {
+            "idx": shot.idx,
+            "candidate_id": str(candidate.id),
+            "backup_candidate_id": str(backup.id) if backup is not None else None,
+            "filter": shot.filter_slug,
+        },
+    )
+    # 预渲染（plans/0012）：锁定即入队剪这个镜头，用户评审后面的镜头时重活已在跑，
+    # 最终「确认渲染」只剩核对指纹与打包。dedupe 防止反复重锁把队列灌满 ——
+    # 任务执行时读的是最新锁定状态，晚到的重复任务是无害的指纹核对。
+    await enqueue_job(
+        session,
+        "shot_render",
+        params={"project_id": str(project.id), "shot_id": str(shot.id)},
+        dedupe=True,
     )
 
 
@@ -517,6 +561,14 @@ async def feedback_shot(
     shot.feedback = feedback
     shot.locked = False
     shot.locked_candidate_id = None
+    shot.backup_candidate_id = None
+    # 撤销锁定时把 approved 复位成 pending：这些候选重新回到「看过但没选中」，
+    # regenerate 时才会被标 rejected 参与负反馈，否则下一轮还会复读
+    await session.execute(
+        update(ShotCandidate)
+        .where(ShotCandidate.shot_id == shot.id, ShotCandidate.status == "approved")
+        .values(status="pending")
+    )
     await append_event(
         session, project, "user", "shot_feedback", {"idx": shot.idx, "text": feedback}
     )

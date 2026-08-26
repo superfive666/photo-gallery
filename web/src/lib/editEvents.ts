@@ -20,7 +20,11 @@ export function describeEvent(event: TimelineEvent): string {
     case 'review_ready':
       return `第 ${num(p.round)} 轮评审开始`
     case 'shot_locked':
-      return `锁定了镜头 ${num(p.idx)}`
+      return p.backup_candidate_id
+        ? `锁定了镜头 ${num(p.idx)}（含备选）`
+        : `锁定了镜头 ${num(p.idx)}`
+    case 'shot_prerendered':
+      return `镜头 ${num(p.idx)} 的片段已提前剪好（最后一步只剩打包）`
     case 'shot_feedback':
       return `对镜头 ${num(p.idx)} 提出：${str(p.text)}`
     case 'regenerate_requested':

@@ -400,6 +400,8 @@ class Shot(Base):
 
     locked: Mapped[bool] = mapped_column(Boolean, default=False)
     locked_candidate_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    # 备选（007）：锁定时可额外指定一条，渲染随主选一同导出，manifest 标 role
+    backup_candidate_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     feedback: Mapped[str | None] = mapped_column(Text)
     round_no: Mapped[int] = mapped_column(Integer, default=1)
 

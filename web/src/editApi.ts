@@ -56,6 +56,7 @@ export interface Shot {
   filter_slug: string | null
   locked: boolean
   locked_candidate_id: string | null
+  backup_candidate_id: string | null
   feedback: string | null
   round_no: number
   candidates: Candidate[]
@@ -128,11 +129,13 @@ export const approveShot = (
   projectId: string,
   shotId: string,
   candidateId: string,
+  backupCandidateId: string | null,
   filterSlug: string | null,
   stateVersion: number,
 ) =>
   post<ActionResponse>(`/edit/projects/${projectId}/shots/${shotId}/approve`, {
     candidate_id: candidateId,
+    backup_candidate_id: backupCandidateId,
     filter_slug: filterSlug,
     state_version: stateVersion,
   })
@@ -158,5 +161,6 @@ export const renderProject = (projectId: string, stateVersion: number) =>
   post<ActionResponse>(`/edit/projects/${projectId}/render`, { state_version: stateVersion })
 
 export const sceneThumbUrl = (sceneId: string) => `${BASE}/edit/scenes/${sceneId}/thumb`
+export const scenePreviewUrl = (sceneId: string) => `${BASE}/edit/scenes/${sceneId}/preview`
 export const filterPreviewUrl = (slug: string) => `${BASE}/edit/filters/${slug}/preview`
 export const downloadUrl = (projectId: string) => `${BASE}/edit/projects/${projectId}/download`

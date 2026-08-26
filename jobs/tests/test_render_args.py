@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from jobs.render import build_ffmpeg_args, project_dirname, slugify
+from jobs.render import build_ffmpeg_args, output_stem, project_dirname, slugify
 
 
 def test_build_ffmpeg_args_frame_accurate_trim() -> None:
@@ -30,6 +30,15 @@ def test_slugify_keeps_chinese_strips_symbols() -> None:
     assert slugify("毕业视频 v2!!") == "毕业视频-v2"
     assert slugify("") == "untitled"
     assert len(slugify("很长" * 100)) <= 40
+
+
+def test_output_stem_backup_sorts_next_to_primary() -> None:
+    primary = output_stem(3, "切蛋糕的瞬间", "primary")
+    backup = output_stem(3, "切蛋糕的瞬间", "backup")
+    assert primary == "03_切蛋糕的瞬间"
+    assert backup == f"{primary}_alt"
+    # 备选文件必须紧跟主选排序（后期软件里按文件名浏览时两条相邻）
+    assert sorted([backup, primary, output_stem(4, "x", "primary")])[:2] == [primary, backup]
 
 
 def test_project_dirname_unique_and_readable() -> None:

@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from gallery_core.models import JobRun
 
 # 剪辑域的队列任务种类（001 的 ingest/recompute 不走队列，保持原样）
-QUEUE_KINDS = ("media_ingest", "project_flow", "render", "filters_import")
+QUEUE_KINDS = ("media_ingest", "project_flow", "render", "filters_import", "shot_render")
 
 
 async def enqueue_job(
