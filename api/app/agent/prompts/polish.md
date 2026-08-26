@@ -19,8 +19,8 @@
       "description": "润色后的具象画面描述（一句话）",
       "queries": ["检索 query 1", "检索 query 2"],
       "media_kind": "any | image | video（剧本明确要照片/视频时才指定，否则 any）",
-      "min_seconds": null,
-      "max_seconds": null
+      "min_seconds": "数字或 null。素材片段至少要多长（秒）。剧本给了镜头目标时长就填在这里 —— 素材只要不短于它即可，成片会再剪裁",
+      "max_seconds": "数字或 null。几乎总是 null。只有剧本明确要求「素材本身不能超过 X 秒」时才填；绝不要把目标时长同时填进 min 和 max —— 那会要求素材恰好等长，什么都匹配不到"
     }
   ]
 }
