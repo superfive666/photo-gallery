@@ -536,6 +536,15 @@ async def approve_shot(
             "filter": shot.filter_slug,
         },
     )
+    # 预渲染（plans/0012）：锁定即入队剪这个镜头，用户评审后面的镜头时重活已在跑，
+    # 最终「确认渲染」只剩核对指纹与打包。dedupe 防止反复重锁把队列灌满 ——
+    # 任务执行时读的是最新锁定状态，晚到的重复任务是无害的指纹核对。
+    await enqueue_job(
+        session,
+        "shot_render",
+        params={"project_id": str(project.id), "shot_id": str(shot.id)},
+        dedupe=True,
+    )
 
 
 async def feedback_shot(

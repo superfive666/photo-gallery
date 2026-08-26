@@ -125,6 +125,38 @@ async def _run_render(settings: Settings, job: JobRun) -> dict[str, Any]:
     return {k: v for k, v in result.items() if k != "bytes"} | {"bytes": result["bytes"]}
 
 
+async def _run_shot_render(settings: Settings, job: JobRun) -> dict[str, Any]:
+    from api.app.services.edit_flow import append_event, lock_project
+    from jobs.render import render_shot
+    from jobs.sources import build_adapter
+
+    project_id = uuid.UUID(str(job.params["project_id"]))
+    shot_id = uuid.UUID(str(job.params["shot_id"]))
+    # 照片候选也预渲染（含现下载），需要源站 adapter —— 与最终渲染同一套
+    adapter = build_adapter()
+    try:
+        # 纯优化路径：失败只标 job 失败，不把项目置 failed ——
+        # 最终渲染会重剪同一片段，那才是有权判项目失败的路径。
+        result = await render_shot(settings, project_id, shot_id, adapter)
+    finally:
+        aclose = getattr(adapter, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+    # 有新剪出的片段才记一条时间线事件；纯缓存命中/已撤销锁定保持安静
+    if int(str(result.get("rendered", 0))) > 0:
+        async with session_scope() as session:
+            project = await lock_project(session, project_id)
+            await append_event(
+                session,
+                project,
+                "system",
+                "shot_prerendered",
+                {"idx": result.get("idx"), "clips": result.get("clips")},
+            )
+    return result
+
+
 async def _run_filters_import(settings: Settings, _job: JobRun) -> dict[str, Any]:
     from pathlib import Path
 
@@ -139,6 +171,7 @@ _HANDLERS = {
     "media_ingest": _run_media_ingest,
     "project_flow": _run_project_flow,
     "render": _run_render,
+    "shot_render": _run_shot_render,
     "filters_import": _run_filters_import,
 }
 
