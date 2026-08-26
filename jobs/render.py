@@ -262,9 +262,7 @@ def write_fingerprint(dst: Path, fingerprint: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _plan_shot(
-    session: AsyncSession, project: EditProject, shot: Shot
-) -> list[_PlannedShot]:
+async def _plan_shot(session: AsyncSession, project: EditProject, shot: Shot) -> list[_PlannedShot]:
     """一个镜头 → 1~2 条渲染项（主选 + 可选备选）。调用方持有会话。"""
     preset: FilterPreset | None = None
     slug = shot.filter_slug or project.default_filter_slug
