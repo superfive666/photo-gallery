@@ -275,9 +275,16 @@ export function EditApp({ album, onLogout }: { album: string; onLogout: () => vo
                 filters={filters}
                 defaultFilter={detail.default_filter_slug}
                 pending={pending}
-                onApprove={(shotId, candId, filterSlug) =>
+                onApprove={(shotId, candId, backupId, filterSlug) =>
                   void act(() =>
-                    approveShot(detail.id, shotId, candId, filterSlug, detail.state_version),
+                    approveShot(
+                      detail.id,
+                      shotId,
+                      candId,
+                      backupId,
+                      filterSlug,
+                      detail.state_version,
+                    ),
                   )
                 }
                 onFeedback={(shotId, text) =>

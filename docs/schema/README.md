@@ -37,7 +37,7 @@ Postgres 16 + [pgvector](https://github.com/pgvector/pgvector) ≥ 0.8。
 | `filter_preset` | 滤镜库 | 一切滤镜都是 3D LUT；slug 唯一；软下架不删行 |
 | `edit_project` | 一次剪辑任务 | 状态机 + state_version 乐观锁；album 创建时固化 |
 | `edit_round` | 反馈闭环留痕 | 每轮用户输入 + shot list 快照 + llm/提示词指纹 |
-| `shot` / `shot_candidate` | 镜头与候选 | locked 后绝不重写；rejected 的 scene 后续轮次排除 |
+| `shot` / `shot_candidate` | 镜头与候选 | locked 后绝不重写；rejected 的 scene 后续轮次排除；007 起可带一条备选（backup_candidate_id），随主选一同渲染 |
 | `render_output` | 渲染产物 | 精确/含余量两组时码 + 滤镜 slug+checksum，可复现 |
 | `project_event` | 事件时间线（聊天窗数据源） | 只追加不改写；无向量无图片字节 |
 

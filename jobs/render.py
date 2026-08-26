@@ -158,12 +158,21 @@ async def _load_image_bytes(item: _PlannedShot, adapter: SourceAdapter | None) -
     return b"".join(chunks)
 
 
+def output_stem(idx: int, description: str, role: str) -> str:
+    """导出文件名（不含扩展名）。备选带 _alt 后缀，与主选相邻排序，
+    manifest 的 role 列是同一信息的机器可读版。"""
+    stem = f"{idx:02d}_{slugify(description, 24)}"
+    return stem if role == "primary" else f"{stem}_alt"
+
+
 @dataclass(slots=True)
 class _PlannedShot:
     """渲染所需的全部输入，材料化成纯值 —— 重活（ffmpeg）期间不持有 ORM 对象与连接。"""
 
     shot_id: uuid.UUID
     idx: int
+    # primary = 主选，backup = 备选（随主选一同导出，后期二选一）
+    role: str
     description: str
     asset_kind: str
     asset_path: str | None
@@ -207,15 +216,6 @@ async def _load_plan(settings: Settings, project_id: uuid.UUID) -> _ProjectPlan:
         for shot in shots:
             if not shot.locked or shot.locked_candidate_id is None:
                 raise RenderError(f"镜头 {shot.idx} 尚未锁定，不能渲染")
-            candidate = await session.get(ShotCandidate, shot.locked_candidate_id)
-            if candidate is None:
-                raise RenderError(f"镜头 {shot.idx} 锁定的候选不存在")
-            scene = await session.get(Scene, candidate.scene_id)
-            if scene is None:
-                raise RenderError(f"镜头 {shot.idx} 的候选 scene 不存在")
-            asset = await session.get(MediaAsset, scene.asset_id)
-            if asset is None:
-                raise RenderError(f"镜头 {shot.idx} 的素材记录不存在")
 
             preset: FilterPreset | None = None
             slug = shot.filter_slug or project.default_filter_slug
@@ -226,25 +226,43 @@ async def _load_plan(settings: Settings, project_id: uuid.UUID) -> _ProjectPlan:
             # 「原色」是恒等 LUT，烧不烧结果一样 —— 跳过烧入省一次全帧计算
             lut_bytes = preset.lut if preset is not None and preset.slug != "original" else None
 
-            planned.append(
-                _PlannedShot(
-                    shot_id=shot.id,
-                    idx=shot.idx,
-                    description=shot.description,
-                    asset_kind=asset.kind,
-                    asset_path=asset.path,
-                    asset_source_url=asset.source_url,
-                    asset_album=asset.album,
-                    asset_duration_ms=asset.duration_ms,
-                    scene_start_ms=scene.start_ms,
-                    scene_end_ms=scene.end_ms,
-                    in_ms=candidate.in_ms,
-                    out_ms=candidate.out_ms,
-                    preset_slug=preset.slug if preset else None,
-                    preset_checksum=preset.checksum if preset else None,
-                    lut_bytes=lut_bytes,
+            # 主选 + 可选备选（007）：同一镜头出两个文件，manifest 标 role
+            picks = [("primary", shot.locked_candidate_id)]
+            if shot.backup_candidate_id is not None:
+                picks.append(("backup", shot.backup_candidate_id))
+
+            for role, candidate_id in picks:
+                label = "主选" if role == "primary" else "备选"
+                candidate = await session.get(ShotCandidate, candidate_id)
+                if candidate is None:
+                    raise RenderError(f"镜头 {shot.idx} 锁定的{label}候选不存在")
+                scene = await session.get(Scene, candidate.scene_id)
+                if scene is None:
+                    raise RenderError(f"镜头 {shot.idx} 的{label}候选 scene 不存在")
+                asset = await session.get(MediaAsset, scene.asset_id)
+                if asset is None:
+                    raise RenderError(f"镜头 {shot.idx} 的{label}素材记录不存在")
+
+                planned.append(
+                    _PlannedShot(
+                        shot_id=shot.id,
+                        idx=shot.idx,
+                        role=role,
+                        description=shot.description,
+                        asset_kind=asset.kind,
+                        asset_path=asset.path,
+                        asset_source_url=asset.source_url,
+                        asset_album=asset.album,
+                        asset_duration_ms=asset.duration_ms,
+                        scene_start_ms=scene.start_ms,
+                        scene_end_ms=scene.end_ms,
+                        in_ms=candidate.in_ms,
+                        out_ms=candidate.out_ms,
+                        preset_slug=preset.slug if preset else None,
+                        preset_checksum=preset.checksum if preset else None,
+                        lut_bytes=lut_bytes,
+                    )
                 )
-            )
         return _ProjectPlan(
             project_id=project.id,
             workspace_id=project.workspace_id,
@@ -288,7 +306,7 @@ async def render_project(
             duration = item.asset_duration_ms or precise_out
             padded_out = min(duration, precise_out + settings.render_handle_ms)
 
-            dst = proj_dir / f"{item.idx:02d}_{slugify(item.description, 24)}.mp4"
+            dst = proj_dir / f"{output_stem(item.idx, item.description, item.role)}.mp4"
             lut_arg: str | None = None
             args: list[str]
             if lut_bytes is not None:
@@ -312,7 +330,7 @@ async def render_project(
             kind = "video"
         else:
             precise_in = precise_out = padded_in = padded_out = 0
-            dst = proj_dir / f"{item.idx:02d}_{slugify(item.description, 24)}.jpg"
+            dst = proj_dir / f"{output_stem(item.idx, item.description, item.role)}.jpg"
             payload = await _load_image_bytes(item, adapter)
             await asyncio.to_thread(_render_image, payload, dst, lut_bytes)
             del payload
@@ -341,6 +359,7 @@ async def render_project(
         manifest_rows.append(
             {
                 "shot": item.idx,
+                "role": item.role,
                 "description": item.description,
                 "file": dst.name,
                 "kind": kind,
@@ -356,7 +375,7 @@ async def render_project(
                 "filter": item.preset_slug or "",
             }
         )
-        log.info("shot_rendered", shot=item.idx, kind=kind, bytes=size)
+        log.info("shot_rendered", shot=item.idx, role=item.role, kind=kind, bytes=size)
 
     manifest_path = proj_dir / "manifest.csv"
     buf = io.StringIO()

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import mimetypes
 import uuid
 from pathlib import Path
 from typing import Annotated, Any
@@ -25,6 +26,7 @@ from api.app.services.edit_flow import FlowError
 from gallery_core.models import (
     EditProject,
     FilterPreset,
+    MediaAsset,
     ProjectEvent,
     RenderOutput,
     Scene,
@@ -172,6 +174,7 @@ class ShotOut(BaseModel):
     filter_slug: str | None
     locked: bool
     locked_candidate_id: str | None
+    backup_candidate_id: str | None
     feedback: str | None
     round_no: int
     candidates: list[CandidateOut]
@@ -232,6 +235,7 @@ async def project_detail(project_id: uuid.UUID, db: DbDep, es: EditDep) -> Proje
             filter_slug=s.filter_slug,
             locked=s.locked,
             locked_candidate_id=str(s.locked_candidate_id) if s.locked_candidate_id else None,
+            backup_candidate_id=str(s.backup_candidate_id) if s.backup_candidate_id else None,
             feedback=s.feedback,
             round_no=s.round_no,
             candidates=[
@@ -319,6 +323,8 @@ async def project_events(
 
 class ApproveIn(BaseModel):
     candidate_id: uuid.UUID
+    # 备选（可选）：与主选一同锁定、一同渲染，manifest 标 role，后期二选一
+    backup_candidate_id: uuid.UUID | None = None
     filter_slug: str | None = None
     in_ms: int | None = Field(default=None, ge=0)
     out_ms: int | None = Field(default=None, ge=0)
@@ -372,7 +378,14 @@ async def approve(
     project = await _locked_project(db, es, project_id, body.state_version)
     try:
         await edit_flow.approve_shot(
-            db, project, shot_id, body.candidate_id, body.filter_slug, body.in_ms, body.out_ms
+            db,
+            project,
+            shot_id,
+            body.candidate_id,
+            body.filter_slug,
+            body.in_ms,
+            body.out_ms,
+            backup_candidate_id=body.backup_candidate_id,
         )
         await db.commit()
     except FlowError as exc:
@@ -441,6 +454,51 @@ async def scene_thumb(scene_id: uuid.UUID, db: DbDep, es: EditDep) -> Response:
     return Response(
         content=scene.keyframe,
         media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
+
+
+def _resolve_media_path(media_root: str, path_str: str) -> Path | None:
+    """素材原片路径防御（与 photos.original 同思路）：解析后必须落在
+    {media_root}/media 内且是文件。正常数据不会越界，这里是防御纵深。"""
+    root = Path(media_root, "media").resolve()
+    try:
+        candidate = Path(path_str).resolve()
+    except OSError:
+        return None
+    if not candidate.is_relative_to(root) or not candidate.is_file():
+        return None
+    return candidate
+
+
+@router.get("/scenes/{scene_id}/preview")
+async def scene_preview(
+    scene_id: uuid.UUID, db: DbDep, es: EditDep, settings: SettingsDep
+) -> FileResponse:
+    """候选视频段预览：直接分发原片文件（FileResponse 原生支持 HTTP Range），
+    浏览器 <video> seek 到 scene 的 start~end 秒段按需拉流，服务端不做剪裁。
+    权限与 thumb 一致：只允许本码绑定相册的 scene。照片候选用 thumb，不走这里。
+    """
+    row = (
+        await db.execute(
+            select(Scene, MediaAsset)
+            .join(MediaAsset, MediaAsset.id == Scene.asset_id)
+            .where(Scene.id == scene_id, Scene.album == es.album)
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="不存在")
+    _scene, asset = row.tuple()
+    if asset.kind != "video" or not asset.path:
+        raise HTTPException(status_code=404, detail="该候选没有可预览的视频")
+
+    resolved = await asyncio.to_thread(_resolve_media_path, settings.media_root, asset.path)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="视频文件不存在")
+    media_type = mimetypes.guess_type(resolved.name)[0] or "video/mp4"
+    return FileResponse(
+        resolved,
+        media_type=media_type,
         headers={"Cache-Control": "private, max-age=86400"},
     )
 
