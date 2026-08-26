@@ -194,6 +194,24 @@ async def _enabled_filter_slugs(session: AsyncSession) -> list[str]:
     return [row[0] for row in rows]
 
 
+def duration_bounds(
+    min_seconds: float | None, max_seconds: float | None
+) -> tuple[int | None, int | None]:
+    """LLM 给的镜头时长收敛成素材筛选条件。
+
+    语义：min = 素材至少要多长（成片会再剪裁），max 只有严格大于 min 时才是
+    真实的上限。剧本常写「这个镜头 X 秒」，模型会填 min == max == X ——
+    那是成片目标时长，不是素材区间；照单全收会要求 scene **恰好等长**，
+    检索必然 0 候选（真实事故：zephyr-hoa 项目全部镜头空手而归）。
+    prompt 里已写明规则，这里是防御层 —— 换模型后 prompt 遵从度不可假设。
+    """
+    min_ms = int(min_seconds * 1000) if min_seconds else None
+    max_ms = int(max_seconds * 1000) if max_seconds else None
+    if min_ms is not None and max_ms is not None and max_ms <= min_ms:
+        max_ms = None
+    return min_ms, max_ms
+
+
 async def _first_round(session: AsyncSession, settings: Settings, project: EditProject) -> None:
     project.status = "parsing"
     slugs = await _enabled_filter_slugs(session)
@@ -204,20 +222,22 @@ async def _first_round(session: AsyncSession, settings: Settings, project: EditP
     if result.default_filter_slug in slugs:
         project.default_filter_slug = result.default_filter_slug
 
-    shots = [
-        Shot(
-            project_id=project.id,
-            idx=draft.idx,
-            source_text=draft.source_text,
-            description=draft.description,
-            queries=list(draft.queries),
-            media_kind=draft.media_kind,
-            min_ms=int(draft.min_seconds * 1000) if draft.min_seconds else None,
-            max_ms=int(draft.max_seconds * 1000) if draft.max_seconds else None,
-            round_no=1,
+    shots = []
+    for draft in result.shots:
+        min_ms, max_ms = duration_bounds(draft.min_seconds, draft.max_seconds)
+        shots.append(
+            Shot(
+                project_id=project.id,
+                idx=draft.idx,
+                source_text=draft.source_text,
+                description=draft.description,
+                queries=list(draft.queries),
+                media_kind=draft.media_kind,
+                min_ms=min_ms,
+                max_ms=max_ms,
+                round_no=1,
+            )
         )
-        for draft in result.shots
-    ]
     session.add_all(shots)
     session.add(
         EditRound(
@@ -360,7 +380,7 @@ async def _retrieve_for_shots(
 
     await apply_edit_search_tuning(session)
 
-    counts: list[dict[str, int]] = []
+    counts: list[dict[str, Any]] = []
     for shot, (offset, n) in zip(shots, spans, strict=True):
         excluded = await _rejected_scene_ids(session, shot.id)
         result_lists = [
@@ -377,6 +397,25 @@ async def _retrieve_for_shots(
             for i in range(n)
         ]
         merged = rrf_merge(result_lists, settings.edit_top_k)
+
+        # 时长过滤把候选清零时降级重试：宁可给出偏短、可评审的素材，也不给
+        # 「零候选」让整轮无从进行。如实标进事件，前端可以据此向用户说明。
+        duration_relaxed = False
+        if not merged and (shot.min_ms is not None or shot.max_ms is not None):
+            result_lists = [
+                await search_scenes(
+                    session,
+                    vectors[offset + i],
+                    settings,
+                    album=project.album,
+                    excluded=excluded,
+                    kind=shot.media_kind,
+                )
+                for i in range(n)
+            ]
+            merged = rrf_merge(result_lists, settings.edit_top_k)
+            duration_relaxed = bool(merged)
+
         for rank, hit in enumerate(merged, start=1):
             session.add(
                 ShotCandidate(
@@ -389,7 +428,10 @@ async def _retrieve_for_shots(
                     final_score=hit.final_score,
                 )
             )
-        counts.append({"idx": shot.idx, "candidates": len(merged)})
+        entry: dict[str, Any] = {"idx": shot.idx, "candidates": len(merged)}
+        if duration_relaxed:
+            entry["duration_relaxed"] = True
+        counts.append(entry)
 
     await append_event(
         session,
