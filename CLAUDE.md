@@ -42,7 +42,8 @@
    不报错，只是慢。见 `docs/schema/README.md`「向量检索的写法」。
 8. **不存任何长期的人物身份数据。** 没有 person 表、不做聚类、不给人脸命名。
    查询是实时的，用完即弃。
-9. **self-hosted runner 上不得因 fork PR 而执行不受信任的代码。** 见 `docs/cicd.md`。
+9. **仓库是公开的：内网地址、真实密钥、生产主机名一律不进仓库。**
+   代码、文档、提交信息都算。`.env` 永不提交，`.env.example` 只放占位值。
 
 ## 常用命令
 
@@ -55,6 +56,7 @@ make probe ALBUM=x  # 探查源站页面结构，不写库
 make ingest ALBUM=x # 批量离线建库
 make test          # api + jobs 的 pytest，web 的 vitest
 make lint          # ruff + mypy + eslint + prettier
+make check         # 提交前门禁：lint + test + 前端构建（本仓库没有 CI）
 make lock          # uv lock --upgrade（升级依赖）
 make eval          # 跑阈值评估集，输出 precision/recall
 ```
@@ -67,7 +69,7 @@ make eval          # 跑阈值评估集，输出 precision/recall
 - **依赖用 uv workspace 管理。** 根 `pyproject.toml` 是 workspace 根，四个成员
   `libs`/`api`/`jobs`/`embedding` 各有自己的 `pyproject.toml`，共用**一份** `uv.lock`。
   加依赖就改对应成员的 `pyproject.toml` 再 `uv lock`，**改完必须提交 uv.lock** ——
-  CI 用 `--frozen`，锁文件没跟上会直接失败（这是故意的）。
+  容器构建用 `--frozen`，锁文件没跟上会直接失败（这是故意的）。
   不要再写 `requirements.txt`，也不要在容器里 `pip install`。
 - 共享代码放 `libs/gallery_core`（包名 `gallery-core`），是四个成员里唯一会被真正构建
   安装的包；`api`/`jobs`/`embedding` 都是 `package = false` 的虚拟成员，代码按源码目录导入。

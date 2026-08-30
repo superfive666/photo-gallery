@@ -120,11 +120,21 @@ test-web: ## vitest
 	cd web && npm run test -- --run
 
 .PHONY: lint
-lint: ## ruff + mypy + eslint + prettier
+lint: ## ruff + mypy + eslint + prettier + tsc
 	$(UV) run ruff check api jobs libs embedding
 	$(UV) run ruff format --check api jobs libs embedding
 	$(UV) run mypy api jobs libs embedding
 	cd web && npm run lint && npx tsc --noEmit
+	cd web && npx prettier --check "src/**/*.{ts,tsx,css}"
+
+# 本仓库没有 CI（见 plans/0013），门禁就是这个目标 —— 提 PR 前自己跑。
+# 内容与原先 ci.yml 的 python / web 两个 job 逐条对齐。
+.PHONY: check
+check: lint test ## 提交前的完整门禁：lint + 全部测试 + 前端构建
+	cd web && npm run build
+	@echo
+	@echo "✅ check 全绿。注意：需要真实 Postgres 的测试在没有 DATABASE_URL 时会跳过，"
+	@echo "   改到 SQL / 迁移时请按 CONTRIBUTING.md 起一个库再跑一遍。"
 
 .PHONY: fmt
 fmt: ## 自动格式化

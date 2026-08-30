@@ -15,7 +15,7 @@
 
 | 路径 | 说明 |
 | --- | --- |
-| `docs/` | 全部设计文档（架构、隐私、CI/CD、评估方法） |
+| `docs/` | 全部设计文档（架构、隐私、部署、评估方法） |
 | `docs/schema/` | Postgres DDL，按 `NNN_name.sql` 顺序编号，随迭代追加 |
 | `docs/plans/` | 每次迭代的计划书，一次迭代一个文件 |
 | `web/` | 前端（React + Vite + TypeScript + Tailwind） |
@@ -24,7 +24,7 @@
 | `jobs/` | 可定时或手动执行的离线任务：拉取 album → 提取人脸 → 落库 → 聚类 |
 | `libs/gallery_core/` | `api` 与 `jobs` 共享的 Python 包（DB 模型、embedding 客户端、配置） |
 | `docker/` | 全部 Dockerfile |
-| `.github/workflows/` | CI/CD（self-hosted runner） |
+| `scripts/` | 运维脚本（`deploy.sh`：生产机上的构建 → 迁移 → 重启 → 回滚） |
 | `pyproject.toml` + `uv.lock` | **uv workspace**：四个 Python 成员共用一份锁文件 |
 
 > `embedding/` 与 `libs/` 是在原定结构上追加的两个目录。前者来自「embedding 走独立容器」的选型；
@@ -89,26 +89,40 @@ uv lock            # 刷新 uv.lock —— 必须一起提交
 uv sync --all-packages
 ```
 
-CI 用 `uv sync --frozen`：改了依赖但忘记提交 `uv.lock` 会直接失败，这是故意的。
+容器构建用 `uv sync --frozen`：改了依赖但忘记提交 `uv.lock` 会直接失败，这是故意的。
 `libs/pyproject.toml` 里的 DB 依赖在 `[db]` extra 中 —— embedding 服务不碰数据库，
 所以它的镜像里没有 sqlalchemy / asyncpg / pgvector。
+
+### 提交前
+
+本仓库没有 CI，门禁在本地：
+
+```bash
+make check      # lint + 全部测试 + 前端构建，内容与原先的 CI 逐条对齐
+```
+
+约定与迭代流程见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 
 ---
 
 ## 部署
 
-两台内网机器都注册成 GitHub self-hosted runner，用机器名做 label 精确定位。
-部署全程在带 GPU 的那台上：就地 `build → 迁移 → 滚动重启 → 健康检查`，
+**没有 CI/CD 自动化**：部署是在生产机上手动跑一个脚本，
+全程在带 GPU 的那台机器上就地完成 `build → 迁移 → 滚动重启 → 健康检查 → 失败回滚`。
+
+```bash
+# 生产机上，仓库 clone 里
+git pull && ./scripts/deploy.sh
+```
+
 **不引入镜像仓库** —— 构建产物直接留在要运行它的 docker 里。
-版本靠 `sha-<short>` tag 区分，回滚就是换个 tag 重新 `up`。
+版本靠 `sha-<short>` tag 区分，回滚就是换个 tag 重新 `up`（本机保留当前 + 上一个版本）。
 
 **数据库用生产机宿主机上已有的 Postgres**，不跑容器化 pg；容器经
 `host.docker.internal` 访问它。本地开发叠加 `docker-compose.localdb.yml`
 即可获得一个容器化 pg（`.env.example` 默认就是这个配置）。
 
-从裸 Ubuntu 到上线的逐步 runbook（含 runner 安装）见
-[`docs/deployment.md`](docs/deployment.md)；分支模型与 workflow 布局见
-[`docs/cicd.md`](docs/cicd.md)。
+从裸 Ubuntu 到上线的逐步 runbook 见 [`docs/deployment.md`](docs/deployment.md)。
 
 ```bash
 # 生产机上叠加 GPU 层（写在 .env 里，这样手敲命令也一致）
