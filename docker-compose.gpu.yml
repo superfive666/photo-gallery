@@ -1,4 +1,4 @@
-# GPU 叠加层。只在有 NVIDIA 卡的机器上启用（生产机 192.168.0.12）。
+# GPU 叠加层。只在有 NVIDIA 卡的机器上启用（生产机 生产机）。
 #
 # 用法：在该机器的 .env 里写
 #     COMPOSE_FILE=docker-compose.yml:docker-compose.gpu.yml

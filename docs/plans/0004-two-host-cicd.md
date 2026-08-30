@@ -1,4 +1,10 @@
-# 0004 — 自建 runner 落地（两台机器，.12 就地构建并部署）
+# 0004 — 自建 runner 落地（两台机器，就地构建并部署）
+
+> ⚠️ **已废弃（2026-08，见 [`0013`](0013-drop-cicd-go-public.md)）。**
+> 仓库转为公开后删除了全部 GitHub Actions workflow 与自建 runner ——
+> public 仓库 + self-hosted runner 是已知的严重安全问题。部署改为在生产机上
+> 手动执行 `scripts/deploy.sh`。本文只作为历史记录保留，其中的 runner 配置
+> **不要照做**；当前部署方式见 [`../deployment.md`](../deployment.md)。
 
 ## 背景
 
@@ -6,8 +12,8 @@
 
 | 机器 | 硬件 | Runner label | 角色 |
 | --- | --- | --- | --- |
-| `192.168.0.12` | x86_64、NVIDIA GPU | `superfive-ubuntu` | 构建 + 部署 + 定时建库 |
-| `192.168.0.15` | Raspberry Pi 5、arm64 | `superfive-pi5` | 已注册，暂无分配 job |
+| 生产机（x86_64 + GPU） | x86_64、NVIDIA GPU | `<生产机 label>` | 构建 + 部署 + 定时建库 |
+| 备用机（arm64） | Raspberry Pi 5、arm64 | `<备用机 label>` | 已注册，暂无分配 job |
 
 ## 目标
 
@@ -21,7 +27,7 @@
 - 新增 `docker-compose.gpu.yml`（GPU 设备声明，只在 `.12` 上叠加）。
 - `docker-compose.yml` 四个可构建服务显式声明 `image`，形式
   `${IMAGE_PREFIX}-<svc>:${IMAGE_TAG}` —— 用默认名（都叫 `:latest`）就没有回滚能力。
-- `deploy.yml` 单 job，跑在 `superfive-ubuntu` 上。
+- `deploy.yml` 单 job，跑在 `<生产机 label>` 上。
 - 生产状态目录固定为 `/opt/photo-gallery`，`.env` 放那里。
 - `web/nginx.conf` 加 `real_ip` —— 前面多了一层宿主机反向代理之后必须的修正。
 - `docs/deployment.md`：runner 安装 + 生产机配置的逐步 runbook。
@@ -73,7 +79,7 @@
 
 `runs-on` 匹配的是 runner 的 **label** 而不是 name，且标签之间是「与」的关系。
 两台机器架构不同（`.15` 是 arm64 的 Pi 5），所以 `runs-on` 写
-`[self-hosted, linux, superfive-ubuntu]` —— 不带 `x64`。
+`[self-hosted, linux, <生产机 label>]` —— 不带 `x64`。
 
 把架构写进 `runs-on` 的后果是「选错机器时永远 Queued」，不报错、不超时，
 是最难定位的一类故障。用一个唯一 label 定位最直接。
@@ -95,7 +101,7 @@
 ## 验收标准
 
 - [ ] 两个 runner 在 Settings → Runners 里都是 **Idle**，label 分别为
-      `superfive-ubuntu` / `superfive-pi5`（不只是 name）。
+      `<生产机 label>` / `<备用机 label>`（不只是 name）。
 - [ ] `.12` 上手动 `docker compose --env-file /opt/photo-gallery/.env --profile tools build`
       能过。
 - [ ] `docker compose ps` 四个服务 healthy。
@@ -119,5 +125,5 @@
    `X-Forwarded-For` 绕过限流。`.env` 里的 `WEB_BIND` 是这条约束的开关。
 4. **`docker system prune -a` 会毁掉回滚能力。** 它会删掉「没有容器在用」的镜像，
    也就是上一个版本。运维文档里只允许 `docker image prune`（带 `until` 过滤）。
-5. **迁移在新镜像启动之前跑**，这个顺序不能改（理由见 `docs/cicd.md`）。
+5. **迁移在新镜像启动之前跑**，这个顺序不能改（理由见 `../deployment.md`）。
    回滚只回滚镜像、不回滚数据库，前提是 DDL 始终只做向后兼容的追加（CLAUDE.md 约束 6）。

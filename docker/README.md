@@ -88,4 +88,5 @@ GPU 构建还会装齐 CUDA 运行时轮子（cublas / cudart / curand / cudnn /
 ## 非 root 运行
 
 除 `web`（nginx 官方镜像自己处理）外都切到 uid 10001 的 `appuser`。
-自建 runner 上尤其重要：容器逃逸的代价直接落在家用机器上。
+构建与运行同机（见 `docs/deployment.md`），容器逃逸的代价直接落在那台机器上 ——
+所以这一条不是形式主义。
